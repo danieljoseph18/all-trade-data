@@ -1,0 +1,27 @@
+[package]
+name = "all-trade-data"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.21.2", features = ["rt-multi-thread", "fs", "signal"] }
+tonic = "0.12.1"
+anyhow = "1.0.98"
+chrono = "0.4.40"
+dotenv = "0.15.0"
+fern = { version = "0.7.1", features = ["colored"] }
+futures = "0.3.31"
+log = "0.4.27"
+tonic-health = "0.12.1"
+yellowstone-grpc-client = "4.0.0"
+yellowstone-grpc-proto = { version = "4.0.0", default-features = false, features = [
+    "plugin",
+] }
+dashmap = "6.1.0"
+base64 = "0.22.1"
+bs58 = "0.5.1"
+solana-program = "2.1.7"
+solana-sdk = "2.1.7"
+deadpool-postgres = "0.14"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+mimalloc = { version = "0.1", default-features = false }
