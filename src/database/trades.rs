@@ -102,8 +102,8 @@ pub fn spawn_batch_inserter(
     running: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buffer: Vec<TradeRecord> = Vec::with_capacity(50);
-        let mut flush_ticker = interval(Duration::from_secs(2));
+        let mut buffer: Vec<TradeRecord> = Vec::with_capacity(500);
+        let mut flush_ticker = interval(Duration::from_secs(60));
         flush_ticker.tick().await; // skip first immediate tick
 
         loop {
@@ -120,7 +120,7 @@ pub fn spawn_batch_inserter(
                     match trade {
                         Some(record) => {
                             buffer.push(record);
-                            if buffer.len() >= 50 {
+                            if buffer.len() >= 500 {
                                 flush_buffer(&pool, &mut buffer).await;
                             }
                         }
@@ -152,7 +152,7 @@ async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
     let count = buffer.len();
 
     // Chunk into groups of 50 to stay well within Postgres parameter limits
-    for chunk in buffer.chunks(50) {
+    for chunk in buffer.chunks(500) {
         if let Err(e) = batch_insert_trades(pool, chunk).await {
             warn!("Failed to batch insert {} trades: {:?}", chunk.len(), e);
         }

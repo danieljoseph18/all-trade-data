@@ -37,7 +37,7 @@ pub async fn init_pool() -> Result<Arc<Pool>> {
             }
 
             cfg.pool = Some(deadpool_postgres::PoolConfig {
-                max_size: 10,
+                max_size: 3,
                 timeouts: deadpool_postgres::Timeouts {
                     wait: Some(std::time::Duration::from_secs(30)),
                     create: Some(std::time::Duration::from_secs(5)),

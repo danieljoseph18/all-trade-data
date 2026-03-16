@@ -58,7 +58,7 @@ pub fn spawn_whitelist_refresh(
     running: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(60));
+        let mut ticker = interval(Duration::from_secs(300));
         ticker.tick().await; // skip first immediate tick
 
         while running.load(Ordering::Relaxed) {
