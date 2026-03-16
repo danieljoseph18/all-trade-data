@@ -10,7 +10,7 @@ use yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo;
 
 use crate::database::TradeRecord;
 use crate::utils::{
-    PUMP_SWAP_PROGRAM_ID, extract_instruction_type, extract_pool_reserves_from_data,
+    PUMP_SWAP_PROGRAM_ID, WSOL_MINT, extract_instruction_type, extract_pool_reserves_from_data,
     extract_sol_volume, extract_transaction_amounts, get_instruction_blocks, get_market_cap_in_sol,
     get_mint_from_instruction, get_program_instructions, get_user,
 };
@@ -90,6 +90,20 @@ fn process_pump_swap_tx(
 
         if !is_buy && !is_sell {
             continue;
+        }
+
+        // Skip non-SOL pools: ensure WSOL is one of the two mints
+        // IDL layout: accounts[3] = base_mint, accounts[4] = quote_mint
+        if instr.accounts.len() > 4 {
+            let base_mint_idx = instr.accounts[3] as usize;
+            let quote_mint_idx = instr.accounts[4] as usize;
+            let base_is_wsol = base_mint_idx < full_accounts.len()
+                && bs58::encode(&full_accounts[base_mint_idx]).into_string() == WSOL_MINT;
+            let quote_is_wsol = quote_mint_idx < full_accounts.len()
+                && bs58::encode(&full_accounts[quote_mint_idx]).into_string() == WSOL_MINT;
+            if !base_is_wsol && !quote_is_wsol {
+                continue;
+            }
         }
 
         // Extract the token mint
