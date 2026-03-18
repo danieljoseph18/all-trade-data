@@ -91,6 +91,10 @@ async fn main() -> Result<()> {
     let inserter_handle =
         database::spawn_batch_inserter(db_pool.clone(), receiver, running.clone());
 
+    // Spawn the trade pruner task (deletes trades older than 14 days, runs hourly)
+    let pruner_handle =
+        database::spawn_trade_pruner(db_pool.clone(), running.clone());
+
     // Create the AMM handler
     let amm_handler = handler::create_amm_handler(whitelist.clone(), sender.clone());
 
@@ -132,9 +136,11 @@ async fn main() -> Result<()> {
     error!("[SHUTDOWN] Aborting gRPC handle...");
     grpc_handle.abort();
 
-    // Step 3: Abort whitelist refresh
+    // Step 3: Abort whitelist refresh and trade pruner
     error!("[SHUTDOWN] Aborting whitelist refresh...");
     whitelist_handle.abort();
+    error!("[SHUTDOWN] Aborting trade pruner...");
+    pruner_handle.abort();
 
     // Step 4: Drop sender to signal batch inserter to drain and stop
     error!("[SHUTDOWN] Dropping trade sender...");

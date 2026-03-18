@@ -40,7 +40,8 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             );
             CREATE INDEX IF NOT EXISTS idx_amm_trades_mint ON amm_trades(mint_address);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_slot ON amm_trades(slot);
-            CREATE INDEX IF NOT EXISTS idx_amm_trades_user ON amm_trades(user_pubkey);",
+            CREATE INDEX IF NOT EXISTS idx_amm_trades_user ON amm_trades(user_pubkey);
+            CREATE INDEX IF NOT EXISTS idx_amm_trades_created_at ON amm_trades(created_at);",
         )
         .await?;
 
@@ -145,6 +146,37 @@ pub fn spawn_batch_inserter(
         }
 
         info!("Batch inserter shut down");
+    })
+}
+
+/// Delete trades older than 14 days.
+pub async fn prune_old_trades(pool: &Pool) -> Result<u64> {
+    let client = pool.get().await?;
+    let rows = client
+        .execute(
+            "DELETE FROM amm_trades WHERE created_at < NOW() - INTERVAL '14 days'",
+            &[],
+        )
+        .await?;
+    Ok(rows)
+}
+
+/// Spawn a background task that prunes old trades every hour.
+pub fn spawn_trade_pruner(
+    pool: Arc<Pool>,
+    running: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(3600));
+        ticker.tick().await; // skip first immediate tick
+        while running.load(Ordering::Relaxed) {
+            ticker.tick().await;
+            match prune_old_trades(&pool).await {
+                Ok(count) if count > 0 => info!("Pruned {} old trades", count),
+                Err(e) => warn!("Failed to prune old trades: {:?}", e),
+                _ => {}
+            }
+        }
     })
 }
 
