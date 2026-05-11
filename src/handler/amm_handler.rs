@@ -10,9 +10,11 @@ use yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo;
 
 use crate::database::TradeRecord;
 use crate::utils::{
-    PUMP_SWAP_PROGRAM_ID, WSOL_MINT, extract_instruction_type, extract_pool_reserves_from_data,
-    extract_sol_volume, extract_transaction_amounts, get_instruction_blocks, get_market_cap_in_sol,
-    get_mint_from_instruction, get_program_instructions, get_user,
+    AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR,
+    PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
+    extract_pool_reserves_from_data, extract_sol_volume, extract_transaction_amounts,
+    find_event_data, get_market_cap_in_sol, get_program_instructions, get_user,
+    resolve_pump_swap_memecoin,
 };
 
 /// Creates the gRPC handler closure that parses Pump Swap AMM transactions,
@@ -35,7 +37,14 @@ pub fn create_amm_handler(
     move |tx_data, slot| handler(tx_data, slot)
 }
 
-/// Parse a Pump Swap transaction, extract trade data, check whitelist, and send to channel.
+/// Parse a Pump Swap transaction, extract every trade instruction (top-level + CPI),
+/// check whitelist, and send a record per trade to the channel.
+///
+/// Detection is discriminator-based on the instruction `data` (canonical Anchor
+/// approach) — independent of log truncation and stable for failed txs. Event
+/// payloads are read from inner-instruction `emit_cpi!` data (not "Program data:"
+/// logs) so multi-trade transactions are attributed correctly via stack_height
+/// bounds in `find_event_data`.
 fn process_pump_swap_tx(
     tx_data: SubscribeUpdateTransactionInfo,
     slot: u64,
@@ -64,96 +73,68 @@ fn process_pump_swap_tx(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Meta missing"))?;
 
-    // Build full account list including loaded addresses
+    // Build full account list including loaded addresses (ALT lookups).
     let mut full_accounts = account_keys.clone();
     full_accounts.extend(meta.loaded_writable_addresses.iter().cloned());
     full_accounts.extend(meta.loaded_readonly_addresses.iter().cloned());
 
-    // Get all Pump Swap program instructions (top-level + CPI)
     let all_instrs = get_program_instructions(msg, meta, &full_accounts, &program_id);
-    let log_blocks = get_instruction_blocks(&meta.log_messages, PUMP_SWAP_PROGRAM_ID);
 
     let tx_signature = bs58::encode(&tx_data.signature).into_string();
     let now = Utc::now();
+    let user = get_user(&full_accounts);
 
-    for (instr_idx, (instr, _parent_idx)) in all_instrs.iter().enumerate() {
-        // Extract instruction type from logs
-        let block_opt = log_blocks.get(instr_idx);
-        let instruction_type = block_opt.and_then(|block| extract_instruction_type(block));
+    for (ix_index, (instr, parent_outer_idx, start_inner_pos)) in all_instrs.iter().enumerate() {
+        if instr.data.len() < 8 {
+            continue;
+        }
+        let disc = &instr.data[..8];
 
-        // Determine buy vs sell
-        let is_buy = matches!(
-            instruction_type.as_deref(),
-            Some("Buy") | Some("BuyExactQuoteIn")
-        );
-        let is_sell = instruction_type.as_deref() == Some("Sell");
-
+        let is_buy = disc == AMM_BUY_DISCRIMINATOR.as_slice()
+            || disc == BUY_EXACT_IN_DISCRIMINATOR.as_slice();
+        let is_sell = disc == AMM_SELL_DISCRIMINATOR.as_slice();
         if !is_buy && !is_sell {
             continue;
         }
 
-        // Skip non-SOL pools: ensure WSOL is one of the two mints
-        // IDL layout: accounts[3] = base_mint, accounts[4] = quote_mint
-        if instr.accounts.len() > 4 {
-            let base_mint_idx = instr.accounts[3] as usize;
-            let quote_mint_idx = instr.accounts[4] as usize;
-            let base_is_wsol = base_mint_idx < full_accounts.len()
-                && bs58::encode(&full_accounts[base_mint_idx]).into_string() == WSOL_MINT;
-            let quote_is_wsol = quote_mint_idx < full_accounts.len()
-                && bs58::encode(&full_accounts[quote_mint_idx]).into_string() == WSOL_MINT;
-            if !base_is_wsol && !quote_is_wsol {
-                continue;
-            }
-        }
-
-        // Extract the token mint
-        let mint = match get_mint_from_instruction(instr, &full_accounts, meta) {
-            Ok(Some(m)) => m,
-            Ok(None) => continue,
-            Err(_) => continue,
+        // Resolve memecoin mint at IDL position 3, skipping scam pools where base==WSOL.
+        let mint = match resolve_pump_swap_memecoin(instr, &full_accounts) {
+            Some(m) => m,
+            None => continue,
         };
 
-        // Filter: only process whitelisted mints
+        // Whitelist filter — must come after mint resolution.
         if !whitelist.contains(&mint) {
             continue;
         }
 
-        // Extract program data from "Program data: " log line
-        let program_data = block_opt.and_then(|block| {
-            block.iter().find_map(|log| {
-                if log.starts_with("Program data: ") {
-                    Some(log.trim_start_matches("Program data: ").trim())
-                } else {
-                    None
-                }
-            })
-        });
+        // Pull the matching event payload from inner instructions (Anchor self-CPI).
+        let event_disc = if is_buy {
+            &PUMP_SWAP_BUY_EVENT_DISC
+        } else {
+            &PUMP_SWAP_SELL_EVENT_DISC
+        };
+        let event_data =
+            match find_event_data(meta, *parent_outer_idx, *start_inner_pos, event_disc) {
+                Some(d) => d,
+                None => continue,
+            };
 
-        let Some(data) = program_data else {
+        let (Some(base_reserves), Some(quote_reserves)) =
+            extract_pool_reserves_from_data(event_data)
+        else {
             continue;
         };
 
-        // Extract pool reserves
-        let (pool_base, pool_quote) = extract_pool_reserves_from_data(data)?;
-        let (Some(base_reserves), Some(quote_reserves)) = (pool_base, pool_quote) else {
-            continue;
-        };
-
-        // Extract SOL volume
-        let (buy_vol, sell_vol) = extract_sol_volume(data)?;
+        let (buy_vol, sell_vol) = extract_sol_volume(event_data);
         let sol_volume = if is_buy {
             buy_vol.unwrap_or(0)
         } else {
             sell_vol.unwrap_or(0)
         };
 
-        // Extract token amount
-        let token_amount = extract_transaction_amounts(data)?.unwrap_or(0);
+        let token_amount = extract_transaction_amounts(event_data).unwrap_or(0);
 
-        // Get user (signer)
-        let user = get_user(&full_accounts);
-
-        // Calculate market cap
         let market_cap = get_market_cap_in_sol(
             base_reserves,
             quote_reserves,
@@ -164,8 +145,9 @@ fn process_pump_swap_tx(
 
         let record = TradeRecord {
             tx_signature: tx_signature.clone(),
+            ix_index: ix_index as i32,
             mint_address: mint,
-            user_pubkey: user,
+            user_pubkey: user.clone(),
             is_buy,
             token_amount: token_amount as i64,
             sol_amount: sol_volume as i64,

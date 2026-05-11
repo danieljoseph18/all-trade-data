@@ -8,9 +8,15 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 
 /// A single AMM trade record to be inserted into the database.
+///
+/// `ix_index` is the position of this trade within its transaction. A single tx
+/// can contain multiple trade instructions (arbitrage, MEV) — without this
+/// disambiguator, an `ON CONFLICT (tx_signature)` insert would silently drop
+/// all but the first trade.
 #[derive(Debug, Clone)]
 pub struct TradeRecord {
     pub tx_signature: String,
+    pub ix_index: i32,
     pub mint_address: String,
     pub user_pubkey: String,
     pub is_buy: bool,
@@ -21,14 +27,19 @@ pub struct TradeRecord {
     pub created_at: DateTime<Utc>,
 }
 
-/// Create the amm_trades table and indexes if they don't exist.
+/// Create the amm_trades table and indexes if they don't exist, and migrate
+/// pre-existing schema (tx_signature-only PK) to the composite PK form.
 pub async fn ensure_table(pool: &Pool) -> Result<()> {
     let client = pool.get().await?;
 
+    // Idempotent create + migration. The DO block widens an existing single-
+    // column PK (tx_signature) to the composite (tx_signature, ix_index) form,
+    // which is required to record every trade in multi-trade txs.
     client
         .batch_execute(
             "CREATE TABLE IF NOT EXISTS amm_trades (
-                tx_signature TEXT PRIMARY KEY,
+                tx_signature TEXT NOT NULL,
+                ix_index INTEGER NOT NULL DEFAULT 0,
                 mint_address TEXT NOT NULL,
                 user_pubkey TEXT NOT NULL,
                 is_buy BOOLEAN NOT NULL,
@@ -36,8 +47,26 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
                 sol_amount BIGINT NOT NULL,
                 market_cap BIGINT,
                 slot BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tx_signature, ix_index)
             );
+
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS ix_index INTEGER NOT NULL DEFAULT 0;
+
+            DO $$
+            DECLARE
+                pk_col_count int;
+            BEGIN
+                SELECT COUNT(*) INTO pk_col_count
+                FROM pg_index i, unnest(i.indkey) AS k
+                WHERE i.indrelid = 'amm_trades'::regclass AND i.indisprimary;
+
+                IF pk_col_count = 1 THEN
+                    EXECUTE 'ALTER TABLE amm_trades DROP CONSTRAINT amm_trades_pkey';
+                    EXECUTE 'ALTER TABLE amm_trades ADD PRIMARY KEY (tx_signature, ix_index)';
+                END IF;
+            END$$;
+
             CREATE INDEX IF NOT EXISTS idx_amm_trades_mint ON amm_trades(mint_address);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_slot ON amm_trades(slot);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_user ON amm_trades(user_pubkey);
@@ -50,6 +79,10 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
 }
 
 /// Batch insert trades using a parameterized query with ON CONFLICT DO NOTHING.
+///
+/// Uses a single client checked out from the pool for the whole batch — callers
+/// chunking large flushes should call this once per chunk, not hold their own
+/// connection across multiple calls.
 pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<()> {
     if trades.is_empty() {
         return Ok(());
@@ -57,13 +90,14 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
 
     let client = pool.get().await?;
 
-    let mut query_parts = Vec::new();
-    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+    let mut query_parts = Vec::with_capacity(trades.len());
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        Vec::with_capacity(trades.len() * 10);
 
     for (i, trade) in trades.iter().enumerate() {
-        let base_idx = i * 9;
+        let base_idx = i * 10;
         query_parts.push(format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
             base_idx + 1,
             base_idx + 2,
             base_idx + 3,
@@ -73,9 +107,11 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
             base_idx + 7,
             base_idx + 8,
             base_idx + 9,
+            base_idx + 10,
         ));
 
         params.push(&trade.tx_signature);
+        params.push(&trade.ix_index);
         params.push(&trade.mint_address);
         params.push(&trade.user_pubkey);
         params.push(&trade.is_buy);
@@ -87,7 +123,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     }
 
     let query = format!(
-        "INSERT INTO amm_trades (tx_signature, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, slot, created_at) VALUES {} ON CONFLICT (tx_signature) DO NOTHING",
+        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, slot, created_at) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
         query_parts.join(",")
     );
 
@@ -96,7 +132,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
 }
 
 /// Spawn a background task that receives TradeRecords from a channel and batch-inserts them.
-/// Flushes every 2 seconds or when the buffer reaches 50 trades.
+/// Flushes every 60 seconds or when the buffer reaches 500 trades.
 pub fn spawn_batch_inserter(
     pool: Arc<Pool>,
     mut receiver: mpsc::Receiver<TradeRecord>,
@@ -183,7 +219,8 @@ pub fn spawn_trade_pruner(
 async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
     let count = buffer.len();
 
-    // Chunk into groups of 50 to stay well within Postgres parameter limits
+    // Chunks of 500 keep us well under the 65,535 bound parameter limit
+    // (500 * 10 = 5,000).
     for chunk in buffer.chunks(500) {
         if let Err(e) = batch_insert_trades(pool, chunk).await {
             warn!("Failed to batch insert {} trades: {:?}", chunk.len(), e);

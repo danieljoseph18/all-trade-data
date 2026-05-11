@@ -22,6 +22,7 @@ pub async fn init_pool() -> Result<Arc<Pool>> {
                 .get_password()
                 .map(|s| String::from_utf8_lossy(s).to_string());
             cfg.dbname = tokio_config.get_dbname().map(|s| s.to_string());
+            cfg.application_name = Some("all-trade-data".to_string());
 
             if let Some(host) = tokio_config.get_hosts().first() {
                 match host {
@@ -36,8 +37,11 @@ pub async fn init_pool() -> Result<Arc<Pool>> {
                 cfg.port = Some(*port);
             }
 
+            // max_size 5: this process performs batched inserts on a single task
+            // and an occasional pruner/whitelist refresh, so 5 is enough to absorb
+            // bursts without idle connections piling up at the DB.
             cfg.pool = Some(deadpool_postgres::PoolConfig {
-                max_size: 3,
+                max_size: 5,
                 timeouts: deadpool_postgres::Timeouts {
                     wait: Some(std::time::Duration::from_secs(30)),
                     create: Some(std::time::Duration::from_secs(5)),
