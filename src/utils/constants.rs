@@ -3,6 +3,11 @@ pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 /// Position of base_mint within a PumpSwap buy/sell/buy_exact_quote_in instruction's accounts.
 pub const PUMP_SWAP_MINT_IX_POS: usize = 3;
+/// Position of quote_mint within a PumpSwap buy/sell/buy_exact_quote_in instruction's
+/// accounts. Used to reject non-SOL-paired pools — pump_amm allows arbitrary
+/// quote mints, but every downstream amount in this collector (sol_amount,
+/// market_cap) assumes lamports.
+pub const PUMP_SWAP_QUOTE_MINT_IX_POS: usize = 4;
 
 // === PumpSwap instruction discriminators (first 8 bytes of instruction data) ===
 pub const AMM_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];

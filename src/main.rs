@@ -55,7 +55,17 @@ async fn main() -> Result<()> {
     let _ = std::fs::write(pid_file, current_pid.to_string());
 
     utils::setup_logger().expect("Failed to initialize logger");
-    info!("Starting All Trade Data collector");
+
+    // READONLY=true: skip DB writes, bypass whitelist, log every parsed trade.
+    // Used to validate extraction correctness against an independent RPC source.
+    let readonly = std::env::var("READONLY")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+
+    info!(
+        "Starting All Trade Data collector ({} mode)",
+        if readonly { "READONLY/validation" } else { "write" }
+    );
 
     // Shared running flag for graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
@@ -73,30 +83,44 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Ensure the amm_trades table exists
-    database::ensure_table(&db_pool).await?;
+    // In readonly we skip table creation/migration (DDL is a write) and the
+    // whitelist load (operator wants to see all trades).
+    if !readonly {
+        database::ensure_table(&db_pool).await?;
+    }
 
-    // Load whitelisted mints
-    info!("Loading whitelisted mints...");
-    let whitelist = database::load_whitelist(&db_pool).await?;
+    let whitelist = if readonly {
+        info!("READONLY: bypassing whitelist filter — all AMM trades will be logged");
+        Arc::new(dashmap::DashSet::new())
+    } else {
+        info!("Loading whitelisted mints...");
+        database::load_whitelist(&db_pool).await?
+    };
 
     // Create the trade record channel
     let (sender, receiver) = tokio::sync::mpsc::channel(10_000);
 
-    // Spawn the whitelist refresh task
-    let whitelist_handle =
-        database::spawn_whitelist_refresh(db_pool.clone(), whitelist.clone(), running.clone());
-
-    // Spawn the batch inserter task
-    let inserter_handle =
-        database::spawn_batch_inserter(db_pool.clone(), receiver, running.clone());
-
-    // Spawn the trade pruner task (deletes trades older than 14 days, runs hourly)
-    let pruner_handle =
-        database::spawn_trade_pruner(db_pool.clone(), running.clone());
+    // Background DB tasks only spawn in write mode.
+    let (whitelist_handle, inserter_handle, pruner_handle) = if readonly {
+        (None, None, None)
+    } else {
+        (
+            Some(database::spawn_whitelist_refresh(
+                db_pool.clone(),
+                whitelist.clone(),
+                running.clone(),
+            )),
+            Some(database::spawn_batch_inserter(
+                db_pool.clone(),
+                receiver,
+                running.clone(),
+            )),
+            Some(database::spawn_trade_pruner(db_pool.clone(), running.clone())),
+        )
+    };
 
     // Create the AMM handler
-    let amm_handler = handler::create_amm_handler(whitelist.clone(), sender.clone());
+    let amm_handler = handler::create_amm_handler(whitelist.clone(), sender.clone(), readonly);
 
     // Grace period for old connections to clean up
     info!("Waiting 3s for old connections to clean up...");
@@ -137,22 +161,24 @@ async fn main() -> Result<()> {
     grpc_handle.abort();
 
     // Step 3: Abort whitelist refresh and trade pruner
-    error!("[SHUTDOWN] Aborting whitelist refresh...");
-    whitelist_handle.abort();
-    error!("[SHUTDOWN] Aborting trade pruner...");
-    pruner_handle.abort();
+    if let Some(h) = whitelist_handle {
+        error!("[SHUTDOWN] Aborting whitelist refresh...");
+        h.abort();
+    }
+    if let Some(h) = pruner_handle {
+        error!("[SHUTDOWN] Aborting trade pruner...");
+        h.abort();
+    }
 
     // Step 4: Drop sender to signal batch inserter to drain and stop
     error!("[SHUTDOWN] Dropping trade sender...");
     drop(sender);
 
     // Step 5: Wait for batch inserter to finish draining
-    error!("[SHUTDOWN] Waiting for batch inserter to finish...");
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        inserter_handle,
-    )
-    .await;
+    if let Some(h) = inserter_handle {
+        error!("[SHUTDOWN] Waiting for batch inserter to finish...");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), h).await;
+    }
 
     // Step 6: Close DB pool
     error!("[SHUTDOWN] Closing DB pool...");

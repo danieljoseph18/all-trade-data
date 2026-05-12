@@ -1,10 +1,11 @@
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashSet;
-use log::{error, warn};
+use log::{error, info, warn};
 use solana_program::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo;
 
@@ -12,22 +13,30 @@ use crate::database::TradeRecord;
 use crate::utils::{
     AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR,
     PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
-    extract_pool_reserves_from_data, extract_sol_volume, extract_transaction_amounts,
-    find_event_data, get_market_cap_in_sol, get_program_instructions, get_user,
-    resolve_pump_swap_memecoin,
+    extract_coin_creator_fee, extract_pool_reserves_from_data, extract_sol_volume,
+    extract_transaction_amounts, find_event_data, get_market_cap_in_sol,
+    get_program_instructions, get_user, pump_swap_quote_is_sol, resolve_pump_swap_memecoin,
 };
+
+/// Per-process running count of trades emitted (across all txs). Used by readonly
+/// validation logs so the operator can quickly see throughput.
+static TRADE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Creates the gRPC handler closure that parses Pump Swap AMM transactions,
 /// filters by whitelisted mints, and sends trade records to the batch inserter.
+///
+/// `readonly`: when true, the whitelist filter is bypassed and every parsed
+/// trade is logged at INFO level instead of sent to the DB-write channel.
 pub fn create_amm_handler(
     whitelist: Arc<DashSet<String>>,
     sender: mpsc::Sender<TradeRecord>,
+    readonly: bool,
 ) -> impl Fn(SubscribeUpdateTransactionInfo, u64) -> Result<()> + Clone + Send + Sync + 'static {
     let handler = Arc::new(move |tx_data: SubscribeUpdateTransactionInfo, slot: u64| {
         let whitelist = whitelist.clone();
         let sender = sender.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_pump_swap_tx(tx_data, slot, &whitelist, &sender) {
+            if let Err(e) = process_pump_swap_tx(tx_data, slot, &whitelist, &sender, readonly) {
                 error!("Error processing AMM transaction: {:?}", e);
             }
         });
@@ -50,6 +59,7 @@ fn process_pump_swap_tx(
     slot: u64,
     whitelist: &DashSet<String>,
     sender: &mpsc::Sender<TradeRecord>,
+    readonly: bool,
 ) -> Result<()> {
     // Skip failed transactions
     if tx_data.meta.as_ref().is_some_and(|m| m.err.is_some()) {
@@ -97,6 +107,14 @@ fn process_pump_swap_tx(
             continue;
         }
 
+        // Reject pools that aren't quoted in SOL. pump_amm allows arbitrary
+        // quote mints (USDC, etc.); recording one of those here would write the
+        // raw quote-microunit value into `sol_amount` and a USDC-denominated
+        // market cap, polluting downstream analytics that assume lamports.
+        if !pump_swap_quote_is_sol(instr, &full_accounts) {
+            continue;
+        }
+
         // Resolve memecoin mint at IDL position 3, skipping scam pools where base==WSOL.
         let mint = match resolve_pump_swap_memecoin(instr, &full_accounts) {
             Some(m) => m,
@@ -104,7 +122,8 @@ fn process_pump_swap_tx(
         };
 
         // Whitelist filter — must come after mint resolution.
-        if !whitelist.contains(&mint) {
+        // Bypassed in readonly validation mode so every AMM trade is observable.
+        if !readonly && !whitelist.contains(&mint) {
             continue;
         }
 
@@ -119,6 +138,14 @@ fn process_pump_swap_tx(
                 Some(d) => d,
                 None => continue,
             };
+
+        // Non-canonical pools (e.g. clones of the program with a forged pool
+        // PDA) emit a zero `coin_creator_fee_basis_points`. Canonical pump_amm
+        // pools always carry a non-zero value, so this is the cheapest sentinel
+        // for filtering them out before any DB write.
+        if let Some(0) = extract_coin_creator_fee(event_data) {
+            continue;
+        }
 
         let (Some(base_reserves), Some(quote_reserves)) =
             extract_pool_reserves_from_data(event_data)
@@ -146,7 +173,7 @@ fn process_pump_swap_tx(
         let record = TradeRecord {
             tx_signature: tx_signature.clone(),
             ix_index: ix_index as i32,
-            mint_address: mint,
+            mint_address: mint.clone(),
             user_pubkey: user.clone(),
             is_buy,
             token_amount: token_amount as i64,
@@ -156,7 +183,31 @@ fn process_pump_swap_tx(
             created_at: now,
         };
 
-        if let Err(e) = sender.try_send(record) {
+        if readonly {
+            // Validation log — every field that ends up in the DB, plus the
+            // human-readable SOL conversions, so a tx can be looked up via RPC
+            // and cross-checked.
+            let n = TRADE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+            let sol_amount_f = sol_volume as f64 / 1_000_000_000.0;
+            let token_amount_f = token_amount as f64 / 1_000_000.0;
+            let market_cap_sol = market_cap as f64 / 1_000_000_000.0;
+            info!(
+                "[TRADE #{n}] slot={slot} sig={sig} ix={ix} {side} mint={mint} user={user} \
+                 sol={sol:.6} tok={tok:.3} mc={mc:.3} SOL base_res={br} quote_res={qr}",
+                n = n,
+                slot = slot,
+                sig = tx_signature,
+                ix = ix_index,
+                side = if is_buy { "BUY " } else { "SELL" },
+                mint = mint,
+                user = user,
+                sol = sol_amount_f,
+                tok = token_amount_f,
+                mc = market_cap_sol,
+                br = base_reserves,
+                qr = quote_reserves,
+            );
+        } else if let Err(e) = sender.try_send(record) {
             warn!("Trade channel full or closed, dropping trade: {:?}", e);
         }
     }

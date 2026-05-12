@@ -1,7 +1,7 @@
 use solana_sdk::pubkey::Pubkey;
 use yellowstone_grpc_proto::prelude::{CompiledInstruction, Message, TransactionStatusMeta};
 
-use super::{PUMP_SWAP_MINT_IX_POS, WSOL_MINT};
+use super::{PUMP_SWAP_MINT_IX_POS, PUMP_SWAP_QUOTE_MINT_IX_POS, WSOL_MINT};
 
 /// Resolve the mint from an instruction's account list at a well-known IDL position.
 ///
@@ -31,6 +31,21 @@ pub fn resolve_pump_swap_memecoin(
         return None;
     }
     Some(mint)
+}
+
+/// True iff this pump_swap instruction's pool is quoted in WSOL. pump_amm allows
+/// arbitrary quote_mints (USDC, etc.); this collector's schema is SOL-units only,
+/// so non-WSOL pools must be rejected at the dispatch edge — otherwise
+/// `sol_amount` and `market_cap` would be recorded in foreign units (e.g. USDC
+/// microunits) and silently corrupt downstream analytics.
+pub fn pump_swap_quote_is_sol(
+    instr: &CompiledInstruction,
+    full_accounts: &[Vec<u8>],
+) -> bool {
+    match resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS) {
+        Some(m) => m == WSOL_MINT,
+        None => false,
+    }
 }
 
 /// Locate an Anchor event payload within the inner instructions of a transaction.
@@ -126,6 +141,17 @@ pub fn extract_sol_volume(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     let sell = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
     let buy = u64::from_le_bytes(bytes[112..120].try_into().unwrap());
     (Some(buy), Some(sell))
+}
+
+/// PumpSwap `coin_creator_fee_basis_points` at offset 344. Used as a
+/// canonical-pool sentinel: trades on canonical pump_amm pools carry a non-zero
+/// creator-fee bps, while non-canonical (fake/scam) pools sharing the same
+/// program emit a zero value. Returns None when the event payload is truncated.
+pub fn extract_coin_creator_fee(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 352 {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes[344..352].try_into().unwrap()))
 }
 
 /// Collects all instructions (direct + CPI) for a specific program ID from a transaction.
