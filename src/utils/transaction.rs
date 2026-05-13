@@ -1,7 +1,13 @@
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{compute_budget, pubkey::Pubkey};
 use yellowstone_grpc_proto::prelude::{CompiledInstruction, Message, TransactionStatusMeta};
 
-use super::{PUMP_SWAP_MINT_IX_POS, PUMP_SWAP_QUOTE_MINT_IX_POS, WSOL_MINT};
+use super::{
+    ASTRALANE_TIP_ADDRESSES, BLOCKRAZOR_TIP_ADDRESSES, BLOCKROUTE_TIP_ADDRESSES,
+    FALCON_TIP_ADDRESSES, HELIUS_TIP_ADDRESSES, JITO_TIP_ADDRESSES, MOONLAND_TIP_ADDRESSES,
+    NEXTBLOCK_TIP_ADDRESSES, NODE_ONE_TIP_ADDRESSES, PUMP_SWAP_MINT_IX_POS,
+    PUMP_SWAP_QUOTE_MINT_IX_POS, SOYAS_TIP_ADDRESSES, STELLIUM_TIP_ADDRESSES,
+    TEMPORAL_TIP_ADDRESSES, WSOL_MINT, ZEROSLOT_TIP_ADDRESSES,
+};
 
 /// Resolve the mint from an instruction's account list at a well-known IDL position.
 ///
@@ -206,6 +212,122 @@ pub fn get_program_instructions(
     }
 
     all_instrs
+}
+
+/// Lookup a known tip-provider by base58 pubkey string. Returns the provider
+/// label that should be persisted as `tip_provider`. `None` means the address
+/// isn't a known landing service.
+///
+/// Only third-party landing services that any market participant can pay are
+/// included. Our own RPC-tip pubkeys (GadFly / Helius RPC / Triton RPC) and
+/// the "Harmonic" sentinel are intentionally excluded — those are signals
+/// specific to our own infrastructure and would only show up for our own
+/// trades, not the general AMM flow this collector observes.
+fn lookup_tip_provider(pubkey: &str) -> Option<&'static str> {
+    if TEMPORAL_TIP_ADDRESSES.contains(&pubkey) {
+        Some("Temporal")
+    } else if NEXTBLOCK_TIP_ADDRESSES.contains(&pubkey) {
+        Some("NextBlock")
+    } else if JITO_TIP_ADDRESSES.contains(&pubkey) {
+        Some("Jito")
+    } else if ZEROSLOT_TIP_ADDRESSES.contains(&pubkey) {
+        Some("ZeroSlot")
+    } else if BLOCKROUTE_TIP_ADDRESSES.contains(&pubkey) {
+        Some("BlockRoute")
+    } else if NODE_ONE_TIP_ADDRESSES.contains(&pubkey) {
+        Some("NodeOne")
+    } else if ASTRALANE_TIP_ADDRESSES.contains(&pubkey) {
+        Some("Astralane")
+    } else if BLOCKRAZOR_TIP_ADDRESSES.contains(&pubkey) {
+        Some("BlockRazor")
+    } else if HELIUS_TIP_ADDRESSES.contains(&pubkey) {
+        Some("HeliusSender")
+    } else if STELLIUM_TIP_ADDRESSES.contains(&pubkey) {
+        Some("Stellium")
+    } else if SOYAS_TIP_ADDRESSES.contains(&pubkey) {
+        Some("Soyas")
+    } else if MOONLAND_TIP_ADDRESSES.contains(&pubkey) {
+        Some("Moonland")
+    } else if FALCON_TIP_ADDRESSES.contains(&pubkey) {
+        Some("Falcon")
+    } else {
+        None
+    }
+}
+
+/// Extract `(priority_fee_microlamports, transfer_tip_lamports, tip_provider)`.
+///
+/// - **priority_fee**: parsed from a compute-budget `SetComputeUnitPrice` ix
+///   (tag byte `3`, u64 little-endian payload). Microlamports per CU.
+/// - **transfer_tip**: positive lamport delta on a known tip-provider account
+///   (pre→post balance). First matching transfer wins.
+/// - **tip_provider**: the label of the matched provider. When no transfer
+///   matches but a priority fee was set, the trade was landed via the raw
+///   validator path and is labeled `"TPU"`. With neither a transfer nor a
+///   priority fee, fall back to `"RPC"` — sent through a regular RPC node with
+///   no landing accelerant.
+pub fn extract_transaction_fees(
+    msg: &Message,
+    meta: &TransactionStatusMeta,
+    full_accounts: &[Vec<u8>],
+) -> (Option<u64>, Option<u64>, Option<String>) {
+    let compute_budget_program_id = compute_budget::id();
+
+    let compute_budget_index = full_accounts.iter().position(|key| {
+        <[u8; 32]>::try_from(key.as_slice())
+            .map(|arr| Pubkey::new_from_array(arr) == compute_budget_program_id)
+            .unwrap_or(false)
+    });
+
+    let mut priority_fee: Option<u64> = None;
+    if let Some(idx) = compute_budget_index {
+        for instr in &msg.instructions {
+            if instr.program_id_index as usize == idx
+                && instr.data.len() >= 9
+                && instr.data[0] == 3
+            {
+                priority_fee =
+                    Some(u64::from_le_bytes(instr.data[1..9].try_into().unwrap()));
+            }
+        }
+    }
+
+    let mut tip_provider: Option<String> = None;
+    let mut transfer_tip: Option<u64> = None;
+
+    let pre_balances = &meta.pre_balances;
+    let post_balances = &meta.post_balances;
+
+    for (idx, account) in full_accounts.iter().enumerate() {
+        let Ok(arr) = <[u8; 32]>::try_from(account.as_slice()) else {
+            continue;
+        };
+        let pubkey_str = Pubkey::new_from_array(arr).to_string();
+        if let Some(service) = lookup_tip_provider(&pubkey_str) {
+            if idx < pre_balances.len() && idx < post_balances.len() {
+                let pre = pre_balances[idx];
+                let post = post_balances[idx];
+                if post > pre {
+                    transfer_tip = Some(post - pre);
+                    tip_provider = Some(service.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    if tip_provider.is_none() {
+        if priority_fee.unwrap_or(0) > 0 {
+            // Priority fee paid with no transfer tip — landed directly via the
+            // validator TPU, no third-party landing service.
+            tip_provider = Some("TPU".to_string());
+        } else {
+            // No tip, no priority fee — plain RPC submission.
+            tip_provider = Some("RPC".to_string());
+        }
+    }
+
+    (priority_fee, transfer_tip, tip_provider)
 }
 
 /// Calculates market cap in SOL (lamports) from pool reserves.

@@ -14,8 +14,9 @@ use crate::utils::{
     AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR,
     PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
     extract_coin_creator_fee, extract_pool_reserves_from_data, extract_sol_volume,
-    extract_transaction_amounts, find_event_data, get_market_cap_in_sol,
-    get_program_instructions, get_user, pump_swap_quote_is_sol, resolve_pump_swap_memecoin,
+    extract_transaction_amounts, extract_transaction_fees, find_event_data,
+    get_market_cap_in_sol, get_program_instructions, get_user, pump_swap_quote_is_sol,
+    resolve_pump_swap_memecoin,
 };
 
 /// Per-process running count of trades emitted (across all txs). Used by readonly
@@ -93,6 +94,12 @@ fn process_pump_swap_tx(
     let tx_signature = bs58::encode(&tx_data.signature).into_string();
     let now = Utc::now();
     let user = get_user(&full_accounts);
+
+    // Fees are tx-level (priority fee on the compute budget ix; tip on a single
+    // transfer), so extract once and replicate to every trade record emitted
+    // for this tx.
+    let (priority_fee, transfer_tip, tip_provider) =
+        extract_transaction_fees(msg, meta, &full_accounts);
 
     for (ix_index, (instr, parent_outer_idx, start_inner_pos)) in all_instrs.iter().enumerate() {
         if instr.data.len() < 8 {
@@ -181,6 +188,9 @@ fn process_pump_swap_tx(
             market_cap: Some(market_cap as i64),
             slot: slot as i64,
             created_at: now,
+            priority_fee: priority_fee.map(|v| v as i64),
+            transfer_tip: transfer_tip.map(|v| v as i64),
+            tip_provider: tip_provider.clone(),
         };
 
         if readonly {
@@ -193,7 +203,8 @@ fn process_pump_swap_tx(
             let market_cap_sol = market_cap as f64 / 1_000_000_000.0;
             info!(
                 "[TRADE #{n}] slot={slot} sig={sig} ix={ix} {side} mint={mint} user={user} \
-                 sol={sol:.6} tok={tok:.3} mc={mc:.3} SOL base_res={br} quote_res={qr}",
+                 sol={sol:.6} tok={tok:.3} mc={mc:.3} SOL base_res={br} quote_res={qr} \
+                 prio={prio:?} tip={tip:?} provider={prov:?}",
                 n = n,
                 slot = slot,
                 sig = tx_signature,
@@ -206,6 +217,9 @@ fn process_pump_swap_tx(
                 mc = market_cap_sol,
                 br = base_reserves,
                 qr = quote_reserves,
+                prio = priority_fee,
+                tip = transfer_tip,
+                prov = tip_provider,
             );
         } else if let Err(e) = sender.try_send(record) {
             warn!("Trade channel full or closed, dropping trade: {:?}", e);

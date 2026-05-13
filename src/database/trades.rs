@@ -25,6 +25,9 @@ pub struct TradeRecord {
     pub market_cap: Option<i64>,
     pub slot: i64,
     pub created_at: DateTime<Utc>,
+    pub priority_fee: Option<i64>,
+    pub transfer_tip: Option<i64>,
+    pub tip_provider: Option<String>,
 }
 
 /// Create the amm_trades table and indexes if they don't exist, and migrate
@@ -48,10 +51,16 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
                 market_cap BIGINT,
                 slot BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
+                priority_fee BIGINT,
+                transfer_tip BIGINT,
+                tip_provider TEXT,
                 PRIMARY KEY (tx_signature, ix_index)
             );
 
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS ix_index INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS priority_fee BIGINT;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS transfer_tip BIGINT;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS tip_provider TEXT;
 
             DO $$
             DECLARE
@@ -90,14 +99,15 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
 
     let client = pool.get().await?;
 
+    const COLS: usize = 13;
     let mut query_parts = Vec::with_capacity(trades.len());
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        Vec::with_capacity(trades.len() * 10);
+        Vec::with_capacity(trades.len() * COLS);
 
     for (i, trade) in trades.iter().enumerate() {
-        let base_idx = i * 10;
+        let base_idx = i * COLS;
         query_parts.push(format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
             base_idx + 1,
             base_idx + 2,
             base_idx + 3,
@@ -108,6 +118,9 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
             base_idx + 8,
             base_idx + 9,
             base_idx + 10,
+            base_idx + 11,
+            base_idx + 12,
+            base_idx + 13,
         ));
 
         params.push(&trade.tx_signature);
@@ -120,10 +133,13 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
         params.push(&trade.market_cap);
         params.push(&trade.slot);
         params.push(&trade.created_at);
+        params.push(&trade.priority_fee);
+        params.push(&trade.transfer_tip);
+        params.push(&trade.tip_provider);
     }
 
     let query = format!(
-        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, slot, created_at) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
+        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, slot, created_at, priority_fee, transfer_tip, tip_provider) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
         query_parts.join(",")
     );
 
@@ -220,7 +236,7 @@ async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
     let count = buffer.len();
 
     // Chunks of 500 keep us well under the 65,535 bound parameter limit
-    // (500 * 10 = 5,000).
+    // (500 * 13 = 6,500).
     for chunk in buffer.chunks(500) {
         if let Err(e) = batch_insert_trades(pool, chunk).await {
             warn!("Failed to batch insert {} trades: {:?}", chunk.len(), e);
