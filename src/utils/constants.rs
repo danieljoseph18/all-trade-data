@@ -1,5 +1,9 @@
 pub const PUMP_SWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+pub const SOL_BASE_UNIT: f64 = 1_000_000_000.0;
+pub const USDC_BASE_UNIT: f64 = 1_000_000.0;
 
 // === Tip-provider pubkeys ===
 // Mirrors the catalog in strategy-data; an inbound transfer to any of these
@@ -159,13 +163,11 @@ pub const FALCON_TIP_ADDRESSES: [&str; 10] = [
     "Fa1con1RDwVwM9VrJ53CwVefD3VU9c58EMpDawV7fLMi",
 ];
 
-
 /// Position of base_mint within a PumpSwap buy/sell/buy_exact_quote_in instruction's accounts.
 pub const PUMP_SWAP_MINT_IX_POS: usize = 3;
 /// Position of quote_mint within a PumpSwap buy/sell/buy_exact_quote_in instruction's
-/// accounts. Used to reject non-SOL-paired pools — pump_amm allows arbitrary
-/// quote mints, but every downstream amount in this collector (sol_amount,
-/// market_cap) assumes lamports.
+/// accounts. Pump AMM allows arbitrary quote mints; this collector accepts SOL
+/// and USDC pools and tags USDC rows with `is_usdc`.
 pub const PUMP_SWAP_QUOTE_MINT_IX_POS: usize = 4;
 
 // === PumpSwap instruction discriminators (first 8 bytes of instruction data) ===

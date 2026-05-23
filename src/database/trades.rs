@@ -21,8 +21,12 @@ pub struct TradeRecord {
     pub user_pubkey: String,
     pub is_buy: bool,
     pub token_amount: i64,
+    /// Quote amount in native pool units: lamports for SOL pools, USDC
+    /// microunits for USDC pools (`is_usdc = true`).
     pub sol_amount: i64,
+    /// Market cap in native pool quote units.
     pub market_cap: Option<i64>,
+    pub is_usdc: bool,
     pub slot: i64,
     pub created_at: DateTime<Utc>,
     pub priority_fee: Option<i64>,
@@ -49,6 +53,7 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
                 token_amount BIGINT NOT NULL,
                 sol_amount BIGINT NOT NULL,
                 market_cap BIGINT,
+                is_usdc BOOLEAN NOT NULL DEFAULT FALSE,
                 slot BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 priority_fee BIGINT,
@@ -61,6 +66,7 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS priority_fee BIGINT;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS transfer_tip BIGINT;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS tip_provider TEXT;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS is_usdc BOOLEAN NOT NULL DEFAULT FALSE;
 
             DO $$
             DECLARE
@@ -99,7 +105,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
 
     let client = pool.get().await?;
 
-    const COLS: usize = 13;
+    const COLS: usize = 14;
     let mut query_parts = Vec::with_capacity(trades.len());
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         Vec::with_capacity(trades.len() * COLS);
@@ -107,7 +113,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     for (i, trade) in trades.iter().enumerate() {
         let base_idx = i * COLS;
         query_parts.push(format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
             base_idx + 1,
             base_idx + 2,
             base_idx + 3,
@@ -121,6 +127,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
             base_idx + 11,
             base_idx + 12,
             base_idx + 13,
+            base_idx + 14,
         ));
 
         params.push(&trade.tx_signature);
@@ -131,6 +138,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
         params.push(&trade.token_amount);
         params.push(&trade.sol_amount);
         params.push(&trade.market_cap);
+        params.push(&trade.is_usdc);
         params.push(&trade.slot);
         params.push(&trade.created_at);
         params.push(&trade.priority_fee);
@@ -139,7 +147,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     }
 
     let query = format!(
-        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, slot, created_at, priority_fee, transfer_tip, tip_provider) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
+        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, is_usdc, slot, created_at, priority_fee, transfer_tip, tip_provider) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
         query_parts.join(",")
     );
 
@@ -236,7 +244,7 @@ async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
     let count = buffer.len();
 
     // Chunks of 500 keep us well under the 65,535 bound parameter limit
-    // (500 * 13 = 6,500).
+    // (500 * 14 = 7,000).
     for chunk in buffer.chunks(500) {
         if let Err(e) = batch_insert_trades(pool, chunk).await {
             warn!("Failed to batch insert {} trades: {:?}", chunk.len(), e);

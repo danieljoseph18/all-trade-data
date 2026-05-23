@@ -6,8 +6,49 @@ use super::{
     FALCON_TIP_ADDRESSES, HELIUS_TIP_ADDRESSES, JITO_TIP_ADDRESSES, MOONLAND_TIP_ADDRESSES,
     NEXTBLOCK_TIP_ADDRESSES, NODE_ONE_TIP_ADDRESSES, PUMP_SWAP_MINT_IX_POS,
     PUMP_SWAP_QUOTE_MINT_IX_POS, SOYAS_TIP_ADDRESSES, STELLIUM_TIP_ADDRESSES,
-    TEMPORAL_TIP_ADDRESSES, WSOL_MINT, ZEROSLOT_TIP_ADDRESSES,
+    TEMPORAL_TIP_ADDRESSES, USDC_BASE_UNIT, USDC_MINT, WSOL_MINT, ZEROSLOT_TIP_ADDRESSES,
 };
+
+/// Supported quote currency for Pump AMM pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteCurrency {
+    Sol,
+    Usdc,
+}
+
+impl QuoteCurrency {
+    #[inline]
+    pub fn is_usdc(self) -> bool {
+        matches!(self, QuoteCurrency::Usdc)
+    }
+
+    #[inline]
+    pub fn base_unit(self) -> f64 {
+        match self {
+            QuoteCurrency::Sol => super::SOL_BASE_UNIT,
+            QuoteCurrency::Usdc => USDC_BASE_UNIT,
+        }
+    }
+
+    #[inline]
+    pub fn label(self) -> &'static str {
+        match self {
+            QuoteCurrency::Sol => "SOL",
+            QuoteCurrency::Usdc => "USDC",
+        }
+    }
+}
+
+/// Classify a quote mint into the supported Pump AMM set.
+pub fn quote_currency_of(quote_mint: &str) -> Option<QuoteCurrency> {
+    if quote_mint == WSOL_MINT {
+        Some(QuoteCurrency::Sol)
+    } else if quote_mint == USDC_MINT {
+        Some(QuoteCurrency::Usdc)
+    } else {
+        None
+    }
+}
 
 /// Resolve the mint from an instruction's account list at a well-known IDL position.
 ///
@@ -39,19 +80,14 @@ pub fn resolve_pump_swap_memecoin(
     Some(mint)
 }
 
-/// True iff this pump_swap instruction's pool is quoted in WSOL. pump_amm allows
-/// arbitrary quote_mints (USDC, etc.); this collector's schema is SOL-units only,
-/// so non-WSOL pools must be rejected at the dispatch edge — otherwise
-/// `sol_amount` and `market_cap` would be recorded in foreign units (e.g. USDC
-/// microunits) and silently corrupt downstream analytics.
-pub fn pump_swap_quote_is_sol(
+/// Classify the quote mint of a pump_swap instruction. Returns `None` for
+/// unsupported quote mints.
+pub fn pump_swap_quote_currency(
     instr: &CompiledInstruction,
     full_accounts: &[Vec<u8>],
-) -> bool {
-    match resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS) {
-        Some(m) => m == WSOL_MINT,
-        None => false,
-    }
+) -> Option<QuoteCurrency> {
+    let mint = resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS)?;
+    quote_currency_of(&mint)
 }
 
 /// Locate an Anchor event payload within the inner instructions of a transaction.
@@ -138,9 +174,10 @@ pub fn extract_transaction_amounts(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
 }
 
-/// PumpSwap quote amounts: (buy_volume @112 = user_quote_amount_in,
-/// sell_volume @64 = quote_amount_out).
-pub fn extract_sol_volume(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
+/// PumpSwap quote amounts: buy_volume @112 = user_quote_amount_in,
+/// sell_volume @64 = quote_amount_out. SOL pools return lamports; USDC pools
+/// return USDC microunits.
+pub fn extract_quote_volume(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     if bytes.len() < 120 {
         return (None, None);
     }
@@ -282,12 +319,9 @@ pub fn extract_transaction_fees(
     let mut priority_fee: Option<u64> = None;
     if let Some(idx) = compute_budget_index {
         for instr in &msg.instructions {
-            if instr.program_id_index as usize == idx
-                && instr.data.len() >= 9
-                && instr.data[0] == 3
+            if instr.program_id_index as usize == idx && instr.data.len() >= 9 && instr.data[0] == 3
             {
-                priority_fee =
-                    Some(u64::from_le_bytes(instr.data[1..9].try_into().unwrap()));
+                priority_fee = Some(u64::from_le_bytes(instr.data[1..9].try_into().unwrap()));
             }
         }
     }
@@ -330,25 +364,27 @@ pub fn extract_transaction_fees(
     (priority_fee, transfer_tip, tip_provider)
 }
 
-/// Calculates market cap in SOL (lamports) from pool reserves.
-pub fn get_market_cap_in_sol(
+/// Calculates market cap in the pool quote currency's smallest unit.
+pub fn get_market_cap_in_quote(
     pool_base: u64,
     pool_quote: u64,
     token_amount: u64,
-    sol_amount: u64,
+    quote_amount: u64,
     is_buy: bool,
+    quote_currency: QuoteCurrency,
 ) -> u64 {
     if pool_base == 0 {
         return 0;
     }
     let mut base_real = pool_base as f64 / 1_000_000.0;
-    let mut quote_real = pool_quote as f64 / 1_000_000_000.0;
+    let quote_base_unit = quote_currency.base_unit();
+    let mut quote_real = pool_quote as f64 / quote_base_unit;
 
     if is_buy {
-        quote_real += sol_amount as f64 / 1_000_000_000.0;
+        quote_real += quote_amount as f64 / quote_base_unit;
         base_real -= token_amount as f64 / 1_000_000.0;
     } else {
-        quote_real -= sol_amount as f64 / 1_000_000_000.0;
+        quote_real -= quote_amount as f64 / quote_base_unit;
         base_real += token_amount as f64 / 1_000_000.0;
     }
 
@@ -356,8 +392,43 @@ pub fn get_market_cap_in_sol(
         return 0;
     }
 
-    let price_per_token_in_sol = quote_real / base_real;
+    let price_per_token_in_quote = quote_real / base_real;
     let total_supply = 1_000_000_000u64;
 
-    (price_per_token_in_sol * total_supply as f64 * 1_000_000_000.0).round() as u64
+    (price_per_token_in_quote * total_supply as f64 * quote_base_unit).round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_currency_supports_sol_and_usdc_only() {
+        assert_eq!(quote_currency_of(WSOL_MINT), Some(QuoteCurrency::Sol));
+        assert_eq!(quote_currency_of(USDC_MINT), Some(QuoteCurrency::Usdc));
+        assert_eq!(quote_currency_of("11111111111111111111111111111111"), None);
+    }
+
+    #[test]
+    fn market_cap_uses_quote_currency_base_unit() {
+        let sol_mc = get_market_cap_in_quote(
+            100_000_000_000_000,
+            500_000_000_000,
+            0,
+            0,
+            true,
+            QuoteCurrency::Sol,
+        );
+        let usdc_mc = get_market_cap_in_quote(
+            100_000_000_000_000,
+            500_000_000,
+            0,
+            0,
+            true,
+            QuoteCurrency::Usdc,
+        );
+
+        assert_eq!(sol_mc, 5_000_000_000_000);
+        assert_eq!(usdc_mc, 5_000_000_000);
+    }
 }

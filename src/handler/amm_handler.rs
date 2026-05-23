@@ -13,9 +13,9 @@ use crate::database::TradeRecord;
 use crate::utils::{
     AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR,
     PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
-    extract_coin_creator_fee, extract_pool_reserves_from_data, extract_sol_volume,
+    extract_coin_creator_fee, extract_pool_reserves_from_data, extract_quote_volume,
     extract_transaction_amounts, extract_transaction_fees, find_event_data,
-    get_market_cap_in_sol, get_program_instructions, get_user, pump_swap_quote_is_sol,
+    get_market_cap_in_quote, get_program_instructions, get_user, pump_swap_quote_currency,
     resolve_pump_swap_memecoin,
 };
 
@@ -114,13 +114,14 @@ fn process_pump_swap_tx(
             continue;
         }
 
-        // Reject pools that aren't quoted in SOL. pump_amm allows arbitrary
-        // quote mints (USDC, etc.); recording one of those here would write the
-        // raw quote-microunit value into `sol_amount` and a USDC-denominated
-        // market cap, polluting downstream analytics that assume lamports.
-        if !pump_swap_quote_is_sol(instr, &full_accounts) {
-            continue;
-        }
+        // Accept SOL and USDC quoted pools; reject arbitrary quote mints.
+        // Existing column names are kept for compatibility, but `sol_amount`
+        // and `market_cap` are native quote units when `is_usdc = true`.
+        let quote_currency = match pump_swap_quote_currency(instr, &full_accounts) {
+            Some(q) => q,
+            None => continue,
+        };
+        let is_usdc = quote_currency.is_usdc();
 
         // Resolve memecoin mint at IDL position 3, skipping scam pools where base==WSOL.
         let mint = match resolve_pump_swap_memecoin(instr, &full_accounts) {
@@ -160,8 +161,8 @@ fn process_pump_swap_tx(
             continue;
         };
 
-        let (buy_vol, sell_vol) = extract_sol_volume(event_data);
-        let sol_volume = if is_buy {
+        let (buy_vol, sell_vol) = extract_quote_volume(event_data);
+        let quote_volume = if is_buy {
             buy_vol.unwrap_or(0)
         } else {
             sell_vol.unwrap_or(0)
@@ -169,12 +170,13 @@ fn process_pump_swap_tx(
 
         let token_amount = extract_transaction_amounts(event_data).unwrap_or(0);
 
-        let market_cap = get_market_cap_in_sol(
+        let market_cap = get_market_cap_in_quote(
             base_reserves,
             quote_reserves,
             token_amount,
-            sol_volume,
+            quote_volume,
             is_buy,
+            quote_currency,
         );
 
         let record = TradeRecord {
@@ -184,8 +186,9 @@ fn process_pump_swap_tx(
             user_pubkey: user.clone(),
             is_buy,
             token_amount: token_amount as i64,
-            sol_amount: sol_volume as i64,
+            sol_amount: quote_volume as i64,
             market_cap: Some(market_cap as i64),
+            is_usdc,
             slot: slot as i64,
             created_at: now,
             priority_fee: priority_fee.map(|v| v as i64),
@@ -198,13 +201,15 @@ fn process_pump_swap_tx(
             // human-readable SOL conversions, so a tx can be looked up via RPC
             // and cross-checked.
             let n = TRADE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-            let sol_amount_f = sol_volume as f64 / 1_000_000_000.0;
+            let quote_base_unit = quote_currency.base_unit();
+            let quote_amount_f = quote_volume as f64 / quote_base_unit;
             let token_amount_f = token_amount as f64 / 1_000_000.0;
-            let market_cap_sol = market_cap as f64 / 1_000_000_000.0;
+            let market_cap_quote = market_cap as f64 / quote_base_unit;
             info!(
                 "[TRADE #{n}] slot={slot} sig={sig} ix={ix} {side} mint={mint} user={user} \
-                 sol={sol:.6} tok={tok:.3} mc={mc:.3} SOL base_res={br} quote_res={qr} \
-                 prio={prio:?} tip={tip:?} provider={prov:?}",
+                 quote={quote:.6} quote_ccy={ccy} is_usdc={is_usdc} tok={tok:.3} \
+                 mc={mc:.3} {ccy} base_res={br} quote_res={qr} prio={prio:?} \
+                 tip={tip:?} provider={prov:?}",
                 n = n,
                 slot = slot,
                 sig = tx_signature,
@@ -212,9 +217,11 @@ fn process_pump_swap_tx(
                 side = if is_buy { "BUY " } else { "SELL" },
                 mint = mint,
                 user = user,
-                sol = sol_amount_f,
+                quote = quote_amount_f,
+                ccy = quote_currency.label(),
+                is_usdc = is_usdc,
                 tok = token_amount_f,
-                mc = market_cap_sol,
+                mc = market_cap_quote,
                 br = base_reserves,
                 qr = quote_reserves,
                 prio = priority_fee,
