@@ -24,14 +24,24 @@ pub struct TradeRecord {
     /// Quote amount in native pool units: lamports for SOL pools, USDC
     /// microunits for USDC pools (`is_usdc = true`).
     pub sol_amount: i64,
-    /// Market cap in native pool quote units.
+    /// Market cap in native pool quote units. `None` for failed trades, which
+    /// carry no executed event payload to derive reserves/price from.
     pub market_cap: Option<i64>,
     pub is_usdc: bool,
+    /// Whether the transaction landed. `false` rows are attempted trades that
+    /// failed on-chain; their `token_amount`/`sol_amount` are the *requested*
+    /// amounts from the instruction args, not executed amounts.
+    pub success: bool,
     pub slot: i64,
     pub created_at: DateTime<Utc>,
     pub priority_fee: Option<i64>,
     pub transfer_tip: Option<i64>,
     pub tip_provider: Option<String>,
+    /// Compute units actually consumed by the transaction (`meta.compute_units_consumed`).
+    pub compute_units_consumed: Option<i64>,
+    /// Priority fee bid expressed as lamports per compute unit
+    /// (`priority_fee` microlamports/CU ÷ 1_000_000).
+    pub lamports_per_compute_unit: Option<f64>,
 }
 
 /// Create the amm_trades table and indexes if they don't exist, and migrate
@@ -54,11 +64,14 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
                 sol_amount BIGINT NOT NULL,
                 market_cap BIGINT,
                 is_usdc BOOLEAN NOT NULL DEFAULT FALSE,
+                success BOOLEAN NOT NULL DEFAULT TRUE,
                 slot BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 priority_fee BIGINT,
                 transfer_tip BIGINT,
                 tip_provider TEXT,
+                compute_units_consumed BIGINT,
+                lamports_per_compute_unit DOUBLE PRECISION,
                 PRIMARY KEY (tx_signature, ix_index)
             );
 
@@ -67,6 +80,9 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS transfer_tip BIGINT;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS tip_provider TEXT;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS is_usdc BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS success BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS compute_units_consumed BIGINT;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS lamports_per_compute_unit DOUBLE PRECISION;
 
             DO $$
             DECLARE
@@ -85,7 +101,8 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_amm_trades_mint ON amm_trades(mint_address);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_slot ON amm_trades(slot);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_user ON amm_trades(user_pubkey);
-            CREATE INDEX IF NOT EXISTS idx_amm_trades_created_at ON amm_trades(created_at);",
+            CREATE INDEX IF NOT EXISTS idx_amm_trades_created_at ON amm_trades(created_at);
+            CREATE INDEX IF NOT EXISTS idx_amm_trades_success ON amm_trades(success);",
         )
         .await?;
 
@@ -105,7 +122,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
 
     let client = pool.get().await?;
 
-    const COLS: usize = 14;
+    const COLS: usize = 17;
     let mut query_parts = Vec::with_capacity(trades.len());
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         Vec::with_capacity(trades.len() * COLS);
@@ -113,7 +130,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     for (i, trade) in trades.iter().enumerate() {
         let base_idx = i * COLS;
         query_parts.push(format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
             base_idx + 1,
             base_idx + 2,
             base_idx + 3,
@@ -128,6 +145,9 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
             base_idx + 12,
             base_idx + 13,
             base_idx + 14,
+            base_idx + 15,
+            base_idx + 16,
+            base_idx + 17,
         ));
 
         params.push(&trade.tx_signature);
@@ -139,15 +159,18 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
         params.push(&trade.sol_amount);
         params.push(&trade.market_cap);
         params.push(&trade.is_usdc);
+        params.push(&trade.success);
         params.push(&trade.slot);
         params.push(&trade.created_at);
         params.push(&trade.priority_fee);
         params.push(&trade.transfer_tip);
         params.push(&trade.tip_provider);
+        params.push(&trade.compute_units_consumed);
+        params.push(&trade.lamports_per_compute_unit);
     }
 
     let query = format!(
-        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, is_usdc, slot, created_at, priority_fee, transfer_tip, tip_provider) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
+        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, is_usdc, success, slot, created_at, priority_fee, transfer_tip, tip_provider, compute_units_consumed, lamports_per_compute_unit) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
         query_parts.join(",")
     );
 
@@ -244,7 +267,7 @@ async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
     let count = buffer.len();
 
     // Chunks of 500 keep us well under the 65,535 bound parameter limit
-    // (500 * 14 = 7,000).
+    // (500 * 17 = 8,500).
     for chunk in buffer.chunks(500) {
         if let Err(e) = batch_insert_trades(pool, chunk).await {
             warn!("Failed to batch insert {} trades: {:?}", chunk.len(), e);

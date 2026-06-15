@@ -174,6 +174,33 @@ pub fn extract_transaction_amounts(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
 }
 
+/// Parse the requested `(token_amount, quote_amount)` from a PumpSwap trade
+/// instruction's args. Used for **failed** transactions, which emit no
+/// BuyEvent/SellEvent self-CPI — the submitted request is the only record of
+/// intent, since nothing executed.
+///
+/// Anchor arg layout, two `u64`s after the 8-byte discriminator:
+/// - `buy`:          base_amount_out (token) @8,  max_quote_amount_in (quote) @16
+/// - `sell`:         base_amount_in  (token) @8,  min_quote_amount_out (quote) @16
+/// - `buy_exact_in`: quote_amount_in (quote) @8,  min_base_amount_out  (token) @16
+///
+/// `is_exact_in` flips the arg order for the `buy_exact_in` variant. Returns
+/// `(0, 0)` when the instruction data is truncated.
+pub fn extract_pump_swap_requested_amounts(data: &[u8], is_exact_in: bool) -> (u64, u64) {
+    if data.len() < 24 {
+        return (0, 0);
+    }
+    let arg0 = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let arg1 = u64::from_le_bytes(data[16..24].try_into().unwrap());
+    if is_exact_in {
+        // quote first, base second
+        (arg1, arg0)
+    } else {
+        // base first, quote second
+        (arg0, arg1)
+    }
+}
+
 /// PumpSwap quote amounts: buy_volume @112 = user_quote_amount_in,
 /// sell_volume @64 = quote_amount_out. SOL pools return lamports; USDC pools
 /// return USDC microunits.
