@@ -38,7 +38,10 @@ pub async fn init_grpc_connection(
         "pump_swap_filter".to_string(),
         SubscribeRequestFilterTransactions {
             vote: Some(false),
-            failed: Some(false),
+            // `None` = include both successful and failed txs. `Some(false)` would
+            // exclude failed txs at the subscription level, so the handler's
+            // `success = false` path would never receive them.
+            failed: None,
             signature: None,
             account_include: vec![PUMP_SWAP_PROGRAM_ID.to_string()],
             account_exclude: vec![],
