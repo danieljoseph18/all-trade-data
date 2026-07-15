@@ -1,0 +1,7 @@
+identity,name,software_client,provider_scope,best_observed_route,matched_fee_comparisons,head_to_head_win_rate,runner_up,runner_up_rate,stable_weeks,total_weeks,interpretation
+3psxMyr7rQzywVp1MXKd1XFmFz33NjydzCoJx9t2sMQW,OtterSec,HarmonicAgave,third_party_lanes,temporal,1669,0.8220,helius,0.4598,2,2,earliest_onchain_copy
+4mtXJ5pUcMMB4t8cLbi7zfDJCHfYLRrQb4qSLmh57sKL,,HarmonicFrankendancer,third_party_lanes,temporal,828,0.7621,astralane,0.5779,2,2,earliest_onchain_copy
+aXiomFkk6VzXaBhPuhMqTLZZguCFzzbyP9LTtZ7ZHLQ,Axiom,HarmonicFrankendancer,third_party_lanes,temporal,500,0.8220,landx,0.4775,2,2,earliest_onchain_copy
+Fd7btgySsrjuo25CJCj7oE7VPMyezDhnx7pZkj2v69Nk,Figment,Rakurai,third_party_lanes,nodeone,5442,0.6137,landx,0.5113,2,2,earliest_onchain_copy
+Ha1iade1AH3B12K9SccfWoPdFtQKKQsj2ZyWwxcjqJJU,Ha1iad3,HarmonicAgave,third_party_lanes,temporal,477,0.8700,stellium,0.5022,2,2,earliest_onchain_copy
+q9XWcZ7T1wP4bW9SB4XgNNwjnFEJ982nE8aVbbNuwot,Ledger by Figment,Rakurai,third_party_lanes,temporal,591,0.6954,landx,0.5261,2,2,earliest_onchain_copy

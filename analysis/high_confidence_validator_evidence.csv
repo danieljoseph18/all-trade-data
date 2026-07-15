@@ -1,0 +1,9 @@
+identity,name,software_client,slots,whole_block_trades,near_simultaneous_priority_comparisons,near_simultaneous_higher_fee_first_rate,event_balanced_rate,same_mint_cross_signer_comparisons,same_mint_higher_fee_first_rate,qualifying_weeks,worst_week_rate,best_week_rate,finding
+9jxgosAfHgHzwnxsHw4RAZYaLVokMbnYtmiZBreynGFP,,Firedancer,1025,99431,145,0.9586,0.9425,29773,0.5327,5,0.9167,1.0000,stable_priority_order_association
+9rkJMARqK6VBkcxGfKBAwnA44gPAfGxPbPsfsggFNDSQ,,JitoLabs,779,70224,121,0.9587,0.9454,22594,0.5307,5,0.9333,1.0000,stable_priority_order_association
+DRpbCBMxVnDK7maPM5tGv6MvB3v1sRMC86PZ8okm21hy,binance staking,AgaveBam,2239,184903,264,0.9811,0.9764,42886,0.7169,5,0.9091,1.0000,stable_priority_order_association_and_broad_fee_sorting
+EvnRmnMrd69kFdbLMxWkTn1icZ7DCceRhvmb2SJXqDo4,Everstake,Frankendancer,1359,132308,188,0.8617,0.8611,26107,0.5330,4,0.7857,0.9375,stable_priority_order_association
+Fd7btgySsrjuo25CJCj7oE7VPMyezDhnx7pZkj2v69Nk,Figment,Rakurai,2882,283333,274,0.9380,0.9446,90390,0.5338,5,0.8929,0.9667,stable_priority_order_association
+HEL1USMZKAL2odpNBj2oCjffnFGaYwmbGmyewGv1e2TU,Helius,JitoLabs,2755,273589,218,0.8853,0.8817,51718,0.6313,5,0.8481,1.0000,stable_priority_order_association
+JD549HsbJHeEKKUrKgg4Fj2iyv2RGjsV7NTZjZUrHybB,Forward Industries,Frankendancer,1173,95913,132,0.8788,0.8802,10052,0.5721,4,0.8095,0.9189,stable_priority_order_association
+q9XWcZ7T1wP4bW9SB4XgNNwjnFEJ982nE8aVbbNuwot,Ledger by Figment,Rakurai,1657,153661,238,0.9244,0.9167,49605,0.5430,5,0.8939,0.9459,stable_priority_order_association
