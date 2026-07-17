@@ -4,7 +4,7 @@ use yellowstone_grpc_proto::prelude::{CompiledInstruction, Message, TransactionS
 use super::{
     ASTRALANE_TIP_ADDRESSES, BLOCKRAZOR_TIP_ADDRESSES, BLOCKROUTE_TIP_ADDRESSES,
     FALCON_TIP_ADDRESSES, HELIUS_TIP_ADDRESSES, JITO_TIP_ADDRESSES, MOONLAND_TIP_ADDRESSES,
-    NEXTBLOCK_TIP_ADDRESSES, NODE_ONE_TIP_ADDRESSES, PUMP_SWAP_MINT_IX_POS,
+    NEXTBLOCK_TIP_ADDRESSES, NODE_ONE_TIP_ADDRESSES, PUMP_SWAP_MINT_IX_POS, PUMP_SWAP_POOL_IX_POS,
     PUMP_SWAP_QUOTE_MINT_IX_POS, SOYAS_TIP_ADDRESSES, STELLIUM_TIP_ADDRESSES,
     TEMPORAL_TIP_ADDRESSES, USDC_BASE_UNIT, USDC_MINT, WSOL_MINT, ZEROSLOT_TIP_ADDRESSES,
 };
@@ -88,6 +88,61 @@ pub fn pump_swap_quote_currency(
 ) -> Option<QuoteCurrency> {
     let mint = resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS)?;
     quote_currency_of(&mint)
+}
+
+/// Verify that a PumpSwap trade targets the canonical index-0 pool created by
+/// the Pump migration program.
+///
+/// A zero creator-fee field in the trade event is not a safe canonical-pool
+/// signal: legitimate cashback and newer fee configurations can emit zero.
+/// Canonical pools have an exact, deterministic PDA instead:
+///
+/// `pool = PDA("pool", 0u16, pool_authority, base_mint, quote_mint)`
+/// `pool_authority = PDA("pool-authority", base_mint)` (Pump program)
+pub fn is_canonical_pump_swap_pool(
+    instr: &CompiledInstruction,
+    full_accounts: &[Vec<u8>],
+    pump_program_id: &Pubkey,
+    pump_swap_program_id: &Pubkey,
+) -> bool {
+    fn account_pubkey(
+        instr: &CompiledInstruction,
+        full_accounts: &[Vec<u8>],
+        instruction_position: usize,
+    ) -> Option<Pubkey> {
+        let account_index = *instr.accounts.get(instruction_position)? as usize;
+        let bytes: [u8; 32] = full_accounts
+            .get(account_index)?
+            .as_slice()
+            .try_into()
+            .ok()?;
+        Some(Pubkey::new_from_array(bytes))
+    }
+
+    let Some(pool) = account_pubkey(instr, full_accounts, PUMP_SWAP_POOL_IX_POS) else {
+        return false;
+    };
+    let Some(base_mint) = account_pubkey(instr, full_accounts, PUMP_SWAP_MINT_IX_POS) else {
+        return false;
+    };
+    let Some(quote_mint) = account_pubkey(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS) else {
+        return false;
+    };
+    let (pool_authority, _) =
+        Pubkey::find_program_address(&[b"pool-authority", base_mint.as_ref()], pump_program_id);
+    let pool_index = 0u16.to_le_bytes();
+    let (expected_pool, _) = Pubkey::find_program_address(
+        &[
+            b"pool",
+            &pool_index,
+            pool_authority.as_ref(),
+            base_mint.as_ref(),
+            quote_mint.as_ref(),
+        ],
+        pump_swap_program_id,
+    );
+
+    pool == expected_pool
 }
 
 /// Locate an Anchor event payload within the inner instructions of a transaction.
@@ -211,17 +266,6 @@ pub fn extract_quote_volume(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     let sell = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
     let buy = u64::from_le_bytes(bytes[112..120].try_into().unwrap());
     (Some(buy), Some(sell))
-}
-
-/// PumpSwap `coin_creator_fee_basis_points` at offset 344. Used as a
-/// canonical-pool sentinel: trades on canonical pump_amm pools carry a non-zero
-/// creator-fee bps, while non-canonical (fake/scam) pools sharing the same
-/// program emit a zero value. Returns None when the event payload is truncated.
-pub fn extract_coin_creator_fee(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() < 352 {
-        return None;
-    }
-    Some(u64::from_le_bytes(bytes[344..352].try_into().unwrap()))
 }
 
 /// Collects all instructions (direct + CPI) for a specific program ID from a transaction.
@@ -428,6 +472,12 @@ pub fn get_market_cap_in_quote(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::{
+        AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID,
+        PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID,
+    };
+    use std::str::FromStr;
+    use yellowstone_grpc_proto::prelude::{InnerInstruction, InnerInstructions};
 
     #[test]
     fn quote_currency_supports_sol_and_usdc_only() {
@@ -457,5 +507,132 @@ mod tests {
 
         assert_eq!(sol_mc, 5_000_000_000_000);
         assert_eq!(usdc_mc, 5_000_000_000);
+    }
+
+    #[test]
+    fn recognizes_reproduced_cpi_fills_as_canonical_pools() {
+        // On-chain CPI buy and sell from slot 433339880. Both events have
+        // coin_creator_fee_basis_points == 0, which the old sentinel rejected.
+        let pump_program = Pubkey::from_str(PUMP_PROGRAM_ID).unwrap();
+        let pump_swap_program = Pubkey::from_str(PUMP_SWAP_PROGRAM_ID).unwrap();
+        let quote = Pubkey::from_str(WSOL_MINT).unwrap();
+        let cases = [
+            (
+                "Fr8astXNXz2dJDfvwCQnmqGprADkH89GSbHT5eRwfwMy",
+                "59dCaphi38eZHiuZjJ2n26BuEcktu9ohdH8eAQd8pump",
+                BUY_EXACT_IN_DISCRIMINATOR,
+            ),
+            (
+                "GQf9SMW9UVkJTiTibWjLSSQWFAhRvdHi58cyBw5y33NR",
+                "6PS6MdRgu3GdfL1ZW25v9xqVFhjBQYLf6yXEndpwY1ko",
+                AMM_SELL_DISCRIMINATOR,
+            ),
+        ];
+
+        for (pool, base, discriminator) in cases {
+            let full_accounts = vec![
+                Pubkey::from_str(pool).unwrap().to_bytes().to_vec(),
+                Pubkey::new_unique().to_bytes().to_vec(),
+                Pubkey::new_unique().to_bytes().to_vec(),
+                Pubkey::from_str(base).unwrap().to_bytes().to_vec(),
+                quote.to_bytes().to_vec(),
+            ];
+            let instr = CompiledInstruction {
+                program_id_index: 5,
+                accounts: vec![0, 1, 2, 3, 4],
+                data: discriminator.to_vec(),
+            };
+
+            assert!(is_canonical_pump_swap_pool(
+                &instr,
+                &full_accounts,
+                &pump_program,
+                &pump_swap_program,
+            ));
+
+            let mut spoofed_accounts = full_accounts;
+            spoofed_accounts[0] = Pubkey::new_unique().to_bytes().to_vec();
+            assert!(!is_canonical_pump_swap_pool(
+                &instr,
+                &spoofed_accounts,
+                &pump_program,
+                &pump_swap_program,
+            ));
+        }
+    }
+
+    #[test]
+    fn finds_event_inside_nested_cpi_trade_subtree() {
+        let event_disc = PUMP_SWAP_BUY_EVENT_DISC;
+        let mut event_data = vec![0u8; 16];
+        event_data[8..16].copy_from_slice(&event_disc);
+
+        let meta = TransactionStatusMeta {
+            inner_instructions: vec![InnerInstructions {
+                index: 2,
+                instructions: vec![
+                    InnerInstruction {
+                        program_id_index: 7,
+                        data: BUY_EXACT_IN_DISCRIMINATOR.to_vec(),
+                        stack_height: Some(3),
+                        ..Default::default()
+                    },
+                    InnerInstruction {
+                        program_id_index: 8,
+                        data: vec![],
+                        stack_height: Some(4),
+                        ..Default::default()
+                    },
+                    InnerInstruction {
+                        program_id_index: 7,
+                        data: event_data,
+                        stack_height: Some(4),
+                        ..Default::default()
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            find_event_data(&meta, 2, 1, &event_disc).map(|data| &data[..8]),
+            Some(event_disc.as_slice()),
+        );
+    }
+
+    #[test]
+    fn does_not_borrow_event_from_sibling_cpi_trade() {
+        let event_disc = PUMP_SWAP_BUY_EVENT_DISC;
+        let mut sibling_event = vec![0u8; 16];
+        sibling_event[8..16].copy_from_slice(&event_disc);
+
+        let meta = TransactionStatusMeta {
+            inner_instructions: vec![InnerInstructions {
+                index: 1,
+                instructions: vec![
+                    InnerInstruction {
+                        program_id_index: 7,
+                        data: BUY_EXACT_IN_DISCRIMINATOR.to_vec(),
+                        stack_height: Some(2),
+                        ..Default::default()
+                    },
+                    InnerInstruction {
+                        program_id_index: 7,
+                        data: BUY_EXACT_IN_DISCRIMINATOR.to_vec(),
+                        stack_height: Some(2),
+                        ..Default::default()
+                    },
+                    InnerInstruction {
+                        program_id_index: 7,
+                        data: sibling_event,
+                        stack_height: Some(3),
+                        ..Default::default()
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+
+        assert!(find_event_data(&meta, 1, 1, &event_disc).is_none());
     }
 }

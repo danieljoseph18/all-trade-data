@@ -11,12 +11,12 @@ use yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo;
 
 use crate::database::TradeRecord;
 use crate::utils::{
-    AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR,
+    AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID,
     PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
-    extract_coin_creator_fee, extract_pool_reserves_from_data,
-    extract_pump_swap_requested_amounts, extract_quote_volume, extract_transaction_amounts,
-    extract_transaction_fees, find_event_data, get_market_cap_in_quote,
-    get_program_instructions, get_user, pump_swap_quote_currency, resolve_pump_swap_memecoin,
+    extract_pool_reserves_from_data, extract_pump_swap_requested_amounts, extract_quote_volume,
+    extract_transaction_amounts, extract_transaction_fees, find_event_data,
+    get_market_cap_in_quote, get_program_instructions, get_user, is_canonical_pump_swap_pool,
+    pump_swap_quote_currency, resolve_pump_swap_memecoin,
 };
 
 /// Per-process running count of trades emitted (across all txs). Used by readonly
@@ -70,6 +70,7 @@ fn process_pump_swap_tx(
     let tx_succeeded = !tx_data.meta.as_ref().is_some_and(|m| m.err.is_some());
 
     let program_id = Pubkey::from_str(PUMP_SWAP_PROGRAM_ID)?;
+    let pump_program_id = Pubkey::from_str(PUMP_PROGRAM_ID)?;
 
     let msg = tx_data
         .transaction
@@ -143,12 +144,17 @@ fn process_pump_swap_tx(
             continue;
         }
 
+        // Only ingest the canonical index-0 pool created by Pump migration.
+        // Event fee fields are not a safe proxy: legitimate cashback/new fee
+        // configurations can report a zero creator-fee rate.
+        if !is_canonical_pump_swap_pool(instr, &full_accounts, &pump_program_id, &program_id) {
+            continue;
+        }
+
         // Successful txs: pull executed amounts/reserves from the BuyEvent/
         // SellEvent self-CPI and compute market cap. Failed txs emit no event,
         // so record the *requested* amounts from the instruction args and leave
-        // market cap NULL. The non-canonical-pool sentinel (zero coin_creator_fee)
-        // also relies on event data, so it only filters successful trades; failed
-        // trades are still bounded to whitelisted, non-WSOL-base mints above.
+        // market cap NULL.
         let (token_amount, quote_volume, market_cap, base_reserves, quote_reserves) =
             if tx_succeeded {
                 let event_disc = if is_buy {
@@ -161,14 +167,6 @@ fn process_pump_swap_tx(
                         Some(d) => d,
                         None => continue,
                     };
-
-                // Non-canonical pools (e.g. clones of the program with a forged
-                // pool PDA) emit a zero `coin_creator_fee_basis_points`. Canonical
-                // pump_amm pools always carry a non-zero value, so this is the
-                // cheapest sentinel for filtering them out before any DB write.
-                if let Some(0) = extract_coin_creator_fee(event_data) {
-                    continue;
-                }
 
                 let (Some(base_reserves), Some(quote_reserves)) =
                     extract_pool_reserves_from_data(event_data)

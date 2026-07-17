@@ -1,4 +1,5 @@
 pub const PUMP_SWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+pub const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -165,6 +166,8 @@ pub const FALCON_TIP_ADDRESSES: [&str; 10] = [
 
 /// Position of base_mint within a PumpSwap buy/sell/buy_exact_quote_in instruction's accounts.
 pub const PUMP_SWAP_MINT_IX_POS: usize = 3;
+/// Position of the pool within a PumpSwap trade instruction's accounts.
+pub const PUMP_SWAP_POOL_IX_POS: usize = 0;
 /// Position of quote_mint within a PumpSwap buy/sell/buy_exact_quote_in instruction's
 /// accounts. Pump AMM allows arbitrary quote mints; this collector accepts SOL
 /// and USDC pools and tags USDC rows with `is_usdc`.
