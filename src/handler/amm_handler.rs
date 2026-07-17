@@ -1,8 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
 use dashmap::DashSet;
-use log::{error, info, warn};
+use log::{info, warn};
 use solana_program::pubkey::Pubkey;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,12 +13,14 @@ use yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo;
 
 use crate::database::TradeRecord;
 use crate::utils::{
-    AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID,
-    PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
-    extract_pool_reserves_from_data, extract_pump_swap_requested_amounts, extract_quote_volume,
-    extract_transaction_amounts, extract_transaction_fees, find_event_data,
-    get_market_cap_in_quote, get_program_instructions, get_user, is_canonical_pump_swap_pool,
-    pump_swap_quote_currency, resolve_pump_swap_memecoin,
+    AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BOOST_BUY_AND_BURN_DISCRIMINATOR,
+    BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_SWAP_BOOST_BUY_EVENT_DISC,
+    PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC, WSOL_MINT,
+    extract_boost_buy_event, extract_pool_reserves_from_data, extract_pump_swap_requested_amounts,
+    extract_quote_volume, extract_transaction_amounts, extract_transaction_fees, find_event_data,
+    get_market_cap_from_reserves, get_program_instructions, is_canonical_pump_swap_pool,
+    quote_currency_of, resolve_instruction_account, resolve_pump_swap_memecoin,
+    resolve_pump_swap_pool, resolve_pump_swap_quote_mint,
 };
 
 /// Per-process running count of trades emitted (across all txs). Used by readonly
@@ -24,38 +28,37 @@ use crate::utils::{
 static TRADE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Creates the gRPC handler closure that parses Pump Swap AMM transactions,
-/// filters by whitelisted mints, and sends trade records to the batch inserter.
+/// sends every qualifying trade record to the batch inserter.
 ///
-/// `readonly`: when true, the whitelist filter is bypassed and every parsed
-/// trade is logged at INFO level instead of sent to the DB-write channel.
+/// `readonly`: when true, every parsed trade is logged at INFO level instead
+/// of sent to the DB-write channel.
 pub fn create_amm_handler(
     whitelist: Arc<DashSet<String>>,
     sender: mpsc::Sender<TradeRecord>,
     readonly: bool,
-) -> impl Fn(SubscribeUpdateTransactionInfo, u64) -> Result<()> + Clone + Send + Sync + 'static {
-    let handler = Arc::new(move |tx_data: SubscribeUpdateTransactionInfo, slot: u64| {
+) -> impl Fn(SubscribeUpdateTransactionInfo, u64) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
++ Clone
++ Send
++ Sync
++ 'static {
+    move |tx_data: SubscribeUpdateTransactionInfo, slot: u64| {
         let whitelist = whitelist.clone();
         let sender = sender.clone();
-        tokio::spawn(async move {
-            if let Err(e) = process_pump_swap_tx(tx_data, slot, &whitelist, &sender, readonly) {
-                error!("Error processing AMM transaction: {:?}", e);
-            }
-        });
-        Ok(())
-    });
-
-    move |tx_data, slot| handler(tx_data, slot)
+        Box::pin(
+            async move { process_pump_swap_tx(tx_data, slot, &whitelist, &sender, readonly).await },
+        )
+    }
 }
 
 /// Parse a Pump Swap transaction, extract every trade instruction (top-level + CPI),
-/// check whitelist, and send a record per trade to the channel.
+/// and send a record per trade to the channel.
 ///
 /// Detection is discriminator-based on the instruction `data` (canonical Anchor
 /// approach) — independent of log truncation and stable for failed txs. Event
 /// payloads are read from inner-instruction `emit_cpi!` data (not "Program data:"
 /// logs) so multi-trade transactions are attributed correctly via stack_height
 /// bounds in `find_event_data`.
-fn process_pump_swap_tx(
+async fn process_pump_swap_tx(
     tx_data: SubscribeUpdateTransactionInfo,
     slot: u64,
     whitelist: &DashSet<String>,
@@ -67,7 +70,7 @@ fn process_pump_swap_tx(
     // not just the ones that executed. A failed tx carries no BuyEvent/SellEvent
     // self-CPI, so for those we record the *requested* amounts parsed from the
     // instruction args rather than executed amounts/reserves/market cap.
-    let tx_succeeded = !tx_data.meta.as_ref().is_some_and(|m| m.err.is_some());
+    let tx_succeeded = tx_data.meta.as_ref().is_none_or(|m| m.err.is_none());
 
     let program_id = Pubkey::from_str(PUMP_SWAP_PROGRAM_ID)?;
     let pump_program_id = Pubkey::from_str(PUMP_PROGRAM_ID)?;
@@ -96,7 +99,6 @@ fn process_pump_swap_tx(
 
     let tx_signature = bs58::encode(&tx_data.signature).into_string();
     let now = Utc::now();
-    let user = get_user(&full_accounts);
 
     // Fees are tx-level (priority fee on the compute budget ix; tip on a single
     // transfer), so extract once and replicate to every trade record emitted
@@ -110,109 +112,172 @@ fn process_pump_swap_tx(
     let compute_units_consumed = meta.compute_units_consumed.map(|v| v as i64);
     let lamports_per_compute_unit = priority_fee.map(|p| p as f64 / 1_000_000.0);
 
-    for (ix_index, (instr, parent_outer_idx, start_inner_pos)) in all_instrs.iter().enumerate() {
+    let mut trade_index = 0i32;
+    for (instr, parent_outer_idx, start_inner_pos) in &all_instrs {
         if instr.data.len() < 8 {
             continue;
         }
         let disc = &instr.data[..8];
 
-        let is_exact_in = disc == BUY_EXACT_IN_DISCRIMINATOR.as_slice();
-        let is_buy = disc == AMM_BUY_DISCRIMINATOR.as_slice() || is_exact_in;
-        let is_sell = disc == AMM_SELL_DISCRIMINATOR.as_slice();
-        if !is_buy && !is_sell {
+        let (instruction_type, is_buy, is_exact_in, event_disc) =
+            if disc == AMM_BUY_DISCRIMINATOR.as_slice() {
+                ("buy", true, false, &PUMP_SWAP_BUY_EVENT_DISC)
+            } else if disc == BUY_EXACT_IN_DISCRIMINATOR.as_slice() {
+                ("buy_exact_quote_in", true, true, &PUMP_SWAP_BUY_EVENT_DISC)
+            } else if disc == AMM_SELL_DISCRIMINATOR.as_slice() {
+                ("sell", false, false, &PUMP_SWAP_SELL_EVENT_DISC)
+            } else if disc == BOOST_BUY_AND_BURN_DISCRIMINATOR.as_slice() {
+                (
+                    "boost_buy_and_burn",
+                    true,
+                    true,
+                    &PUMP_SWAP_BOOST_BUY_EVENT_DISC,
+                )
+            } else {
+                continue;
+            };
+
+        let Some(mint) = resolve_pump_swap_memecoin(instr, &full_accounts) else {
+            continue;
+        };
+        if mint == WSOL_MINT {
             continue;
         }
-
-        // Accept SOL and USDC quoted pools; reject arbitrary quote mints.
-        // Existing column names are kept for compatibility, but `sol_amount`
-        // and `market_cap` are native quote units when `is_usdc = true`.
-        let quote_currency = match pump_swap_quote_currency(instr, &full_accounts) {
-            Some(q) => q,
-            None => continue,
+        let Some(quote_mint) = resolve_pump_swap_quote_mint(instr, &full_accounts) else {
+            continue;
         };
-        let is_usdc = quote_currency.is_usdc();
-
-        // Resolve memecoin mint at IDL position 3, skipping scam pools where base==WSOL.
-        let mint = match resolve_pump_swap_memecoin(instr, &full_accounts) {
-            Some(m) => m,
-            None => continue,
-        };
-
-        // Whitelist filter — must come after mint resolution.
-        // Bypassed in readonly validation mode so every AMM trade is observable.
+        let quote_currency = quote_currency_of(&quote_mint);
+        if quote_currency.is_none() {
+            continue;
+        }
         if !readonly && !whitelist.contains(&mint) {
             continue;
         }
-
-        // Only ingest the canonical index-0 pool created by Pump migration.
-        // Event fee fields are not a safe proxy: legitimate cashback/new fee
-        // configurations can report a zero creator-fee rate.
-        if !is_canonical_pump_swap_pool(instr, &full_accounts, &pump_program_id, &program_id) {
+        let canonical =
+            is_canonical_pump_swap_pool(instr, &full_accounts, &pump_program_id, &program_id);
+        if !canonical {
             continue;
         }
+        let Some(pool_address) = resolve_pump_swap_pool(instr, &full_accounts) else {
+            continue;
+        };
+        let user = resolve_instruction_account(instr, &full_accounts, 1)
+            .unwrap_or_else(|| "unknown".to_string());
+        let is_usdc = quote_currency.is_some_and(|currency| currency.is_usdc());
+        let requested_amounts = || {
+            let (token_amount, quote_volume) =
+                extract_pump_swap_requested_amounts(&instr.data, is_exact_in);
+            (
+                token_amount,
+                quote_volume,
+                None,
+                0,
+                0,
+                "instruction_request",
+            )
+        };
 
         // Successful txs: pull executed amounts/reserves from the BuyEvent/
         // SellEvent self-CPI and compute market cap. Failed txs emit no event,
         // so record the *requested* amounts from the instruction args and leave
         // market cap NULL.
-        let (token_amount, quote_volume, market_cap, base_reserves, quote_reserves) =
+        let (token_amount, quote_volume, market_cap, base_reserves, quote_reserves, amount_source) =
             if tx_succeeded {
-                let event_disc = if is_buy {
-                    &PUMP_SWAP_BUY_EVENT_DISC
+                if let Some(event_data) = find_event_data(
+                    meta,
+                    *parent_outer_idx,
+                    *start_inner_pos,
+                    instr.program_id_index,
+                    event_disc,
+                ) {
+                    if instruction_type == "boost_buy_and_burn" {
+                        if let Some((token_amount, quote_volume, base_reserves, quote_reserves)) =
+                            extract_boost_buy_event(event_data)
+                        {
+                            let market_cap = if canonical && mint != WSOL_MINT {
+                                quote_currency.map(|currency| {
+                                    get_market_cap_from_reserves(
+                                        base_reserves,
+                                        quote_reserves,
+                                        currency,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            (
+                                token_amount,
+                                quote_volume,
+                                market_cap,
+                                base_reserves,
+                                quote_reserves,
+                                "event",
+                            )
+                        } else {
+                            requested_amounts()
+                        }
+                    } else {
+                        let (base_reserves, quote_reserves) =
+                            extract_pool_reserves_from_data(event_data);
+                        let (buy_vol, sell_vol) = extract_quote_volume(event_data);
+                        let quote_volume = if is_buy { buy_vol } else { sell_vol };
+                        if let (
+                            Some(base_reserves),
+                            Some(quote_reserves),
+                            Some(quote_volume),
+                            Some(token_amount),
+                        ) = (
+                            base_reserves,
+                            quote_reserves,
+                            quote_volume,
+                            extract_transaction_amounts(event_data),
+                        ) {
+                            let market_cap = if canonical && mint != WSOL_MINT {
+                                // BuyEvent/SellEvent pool reserves are the
+                                // post-trade values. Applying the trade delta
+                                // again creates a phantom price one fill ahead.
+                                quote_currency.map(|currency| {
+                                    get_market_cap_from_reserves(
+                                        base_reserves,
+                                        quote_reserves,
+                                        currency,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            (
+                                token_amount,
+                                quote_volume,
+                                market_cap,
+                                base_reserves,
+                                quote_reserves,
+                                "event",
+                            )
+                        } else {
+                            requested_amounts()
+                        }
+                    }
                 } else {
-                    &PUMP_SWAP_SELL_EVENT_DISC
-                };
-                let event_data =
-                    match find_event_data(meta, *parent_outer_idx, *start_inner_pos, event_disc) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                let (Some(base_reserves), Some(quote_reserves)) =
-                    extract_pool_reserves_from_data(event_data)
-                else {
-                    continue;
-                };
-
-                let (buy_vol, sell_vol) = extract_quote_volume(event_data);
-                let quote_volume = if is_buy {
-                    buy_vol.unwrap_or(0)
-                } else {
-                    sell_vol.unwrap_or(0)
-                };
-
-                let token_amount = extract_transaction_amounts(event_data).unwrap_or(0);
-
-                let market_cap = get_market_cap_in_quote(
-                    base_reserves,
-                    quote_reserves,
-                    token_amount,
-                    quote_volume,
-                    is_buy,
-                    quote_currency,
-                );
-
-                (
-                    token_amount,
-                    quote_volume,
-                    Some(market_cap as i64),
-                    base_reserves,
-                    quote_reserves,
-                )
+                    requested_amounts()
+                }
             } else {
-                let (token_amount, quote_volume) =
-                    extract_pump_swap_requested_amounts(&instr.data, is_exact_in);
-                (token_amount, quote_volume, None, 0, 0)
+                requested_amounts()
             };
 
         let record = TradeRecord {
             tx_signature: tx_signature.clone(),
-            ix_index: ix_index as i32,
+            ix_index: trade_index,
+            pool_address,
             mint_address: mint.clone(),
+            quote_mint_address: quote_mint.clone(),
+            instruction_type: instruction_type.to_string(),
+            amount_source: amount_source.to_string(),
+            is_cpi: *start_inner_pos > 0,
             user_pubkey: user.clone(),
             is_buy,
-            token_amount: token_amount as i64,
-            sol_amount: quote_volume as i64,
+            token_amount,
+            sol_amount: quote_volume,
             market_cap,
             is_usdc,
             success: tx_succeeded,
@@ -230,25 +295,30 @@ fn process_pump_swap_tx(
             // human-readable SOL conversions, so a tx can be looked up via RPC
             // and cross-checked.
             let n = TRADE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-            let quote_base_unit = quote_currency.base_unit();
+            let quote_base_unit = quote_currency.map_or(1.0, |currency| currency.base_unit());
             let quote_amount_f = quote_volume as f64 / quote_base_unit;
             let token_amount_f = token_amount as f64 / 1_000_000.0;
             let market_cap_quote = market_cap.map(|m| m as f64 / quote_base_unit);
             info!(
                 "[TRADE #{n}] slot={slot} sig={sig} ix={ix} {side} mint={mint} user={user} \
-                 success={succ} quote={quote:.6} quote_ccy={ccy} is_usdc={is_usdc} tok={tok:.3} \
+                 route={route} success={succ} quote={quote:.6} quote_ccy={ccy} is_usdc={is_usdc} tok={tok:.3} \
                  mc={mc:?} base_res={br} quote_res={qr} prio={prio:?} \
                  tip={tip:?} provider={prov:?} cu={cu:?} lpcu={lpcu:?}",
                 n = n,
                 slot = slot,
                 sig = tx_signature,
-                ix = ix_index,
+                ix = trade_index,
                 side = if is_buy { "BUY " } else { "SELL" },
                 mint = mint,
                 user = user,
+                route = if *start_inner_pos > 0 {
+                    "cpi"
+                } else {
+                    "direct"
+                },
                 succ = tx_succeeded,
                 quote = quote_amount_f,
-                ccy = quote_currency.label(),
+                ccy = quote_currency.map_or("OTHER", |currency| currency.label()),
                 is_usdc = is_usdc,
                 tok = token_amount_f,
                 mc = market_cap_quote,
@@ -260,10 +330,309 @@ fn process_pump_swap_tx(
                 cu = compute_units_consumed,
                 lpcu = lamports_per_compute_unit,
             );
-        } else if let Err(e) = sender.try_send(record) {
-            warn!("Trade channel full or closed, dropping trade: {:?}", e);
+        } else if let Err(e) = sender.send(record).await {
+            warn!("Trade channel closed; unable to persist trade: {:?}", e);
         }
+        trade_index += 1;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::{
+        AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BOOST_BUY_AND_BURN_DISCRIMINATOR,
+        BUY_EXACT_IN_DISCRIMINATOR, PUMP_SWAP_BOOST_BUY_EVENT_DISC, PUMP_SWAP_BUY_EVENT_DISC,
+        PUMP_SWAP_SELL_EVENT_DISC,
+    };
+    use yellowstone_grpc_proto::prelude::{
+        CompiledInstruction, InnerInstruction, InnerInstructions, Message, Transaction,
+        TransactionError, TransactionStatusMeta,
+    };
+
+    const PROGRAM_INDEX: u32 = 5;
+    const ROUTER_INDEX: u32 = 6;
+
+    fn instruction(discriminator: [u8; 8], arg0: u64, arg1: u64) -> CompiledInstruction {
+        let mut data = discriminator.to_vec();
+        data.extend_from_slice(&arg0.to_le_bytes());
+        data.extend_from_slice(&arg1.to_le_bytes());
+        CompiledInstruction {
+            program_id_index: PROGRAM_INDEX,
+            accounts: vec![0, 1, 2, 3, 4],
+            data,
+        }
+    }
+
+    fn emitted_event(kind: &str, token: u64, quote: u64, stack_height: u32) -> InnerInstruction {
+        let (disc, len) = match kind {
+            "sell" => (PUMP_SWAP_SELL_EVENT_DISC, 120),
+            "boost_buy_and_burn" => (PUMP_SWAP_BOOST_BUY_EVENT_DISC, 200),
+            _ => (PUMP_SWAP_BUY_EVENT_DISC, 120),
+        };
+        let mut event = vec![0u8; len];
+        event[..8].copy_from_slice(&disc);
+        if kind == "boost_buy_and_burn" {
+            event[152..160].copy_from_slice(&quote.to_le_bytes());
+            event[160..168].copy_from_slice(&token.to_le_bytes());
+            event[184..192].copy_from_slice(&900u64.to_le_bytes());
+            event[192..200].copy_from_slice(&800u64.to_le_bytes());
+        } else {
+            event[16..24].copy_from_slice(&token.to_le_bytes());
+            event[48..56].copy_from_slice(&800u64.to_le_bytes());
+            event[56..64].copy_from_slice(&900u64.to_le_bytes());
+            let quote_offset = if kind == "sell" { 64 } else { 112 };
+            event[quote_offset..quote_offset + 8].copy_from_slice(&quote.to_le_bytes());
+        }
+
+        // Anchor emit_cpi! prefix followed by the event discriminator/payload.
+        let mut data = vec![0u8; 8];
+        data.extend(event);
+        InnerInstruction {
+            program_id_index: PROGRAM_INDEX,
+            data,
+            stack_height: Some(stack_height),
+            ..Default::default()
+        }
+    }
+
+    fn fixture(with_events: bool, failed: bool) -> SubscribeUpdateTransactionInfo {
+        let user = Pubkey::new_unique();
+        let global = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(WSOL_MINT).unwrap();
+        let pump_swap = Pubkey::from_str(PUMP_SWAP_PROGRAM_ID).unwrap();
+        let pump = Pubkey::from_str(PUMP_PROGRAM_ID).unwrap();
+        let (pool_authority, _) =
+            Pubkey::find_program_address(&[b"pool-authority", base.as_ref()], &pump);
+        let pool_index = 0u16.to_le_bytes();
+        let (pool, _) = Pubkey::find_program_address(
+            &[
+                b"pool",
+                &pool_index,
+                pool_authority.as_ref(),
+                base.as_ref(),
+                quote.as_ref(),
+            ],
+            &pump_swap,
+        );
+        let router = Pubkey::new_unique();
+        let account_keys = [pool, user, global, base, quote, pump_swap, router]
+            .into_iter()
+            .map(|key| key.to_bytes().to_vec())
+            .collect();
+
+        let variants = [
+            ("buy", AMM_BUY_DISCRIMINATOR),
+            ("buy_exact_quote_in", BUY_EXACT_IN_DISCRIMINATOR),
+            ("sell", AMM_SELL_DISCRIMINATOR),
+            ("boost_buy_and_burn", BOOST_BUY_AND_BURN_DISCRIMINATOR),
+        ];
+        let direct: Vec<_> = variants
+            .iter()
+            .enumerate()
+            .map(|(i, (_, disc))| {
+                let arg1 = if failed && i == 0 {
+                    u64::MAX
+                } else {
+                    20 + i as u64
+                };
+                instruction(*disc, 10 + i as u64, arg1)
+            })
+            .collect();
+        let mut outer = direct.clone();
+        outer.push(CompiledInstruction {
+            program_id_index: ROUTER_INDEX,
+            ..Default::default()
+        });
+
+        let mut inner_instructions = Vec::new();
+        if with_events {
+            for (i, (kind, _)) in variants.iter().enumerate() {
+                inner_instructions.push(InnerInstructions {
+                    index: i as u32,
+                    instructions: vec![emitted_event(kind, 100 + i as u64, 200 + i as u64, 2)],
+                });
+            }
+
+            // The same four variants routed through a custom program as CPIs.
+            let mut routed = Vec::new();
+            for (i, ((kind, _), trade)) in variants.iter().zip(direct).enumerate() {
+                routed.push(InnerInstruction {
+                    program_id_index: trade.program_id_index,
+                    accounts: trade.accounts,
+                    data: trade.data,
+                    stack_height: Some(2),
+                });
+                routed.push(emitted_event(kind, 100 + i as u64, 200 + i as u64, 3));
+            }
+            inner_instructions.push(InnerInstructions {
+                index: 4,
+                instructions: routed,
+            });
+        }
+
+        SubscribeUpdateTransactionInfo {
+            signature: vec![7u8; 64],
+            transaction: Some(Transaction {
+                message: Some(Message {
+                    account_keys,
+                    instructions: outer,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            meta: Some(TransactionStatusMeta {
+                err: failed.then(|| TransactionError { err: vec![1] }),
+                inner_instructions,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn captures_every_current_trade_variant_direct_and_through_cpi() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let tx = fixture(true, false);
+        let whitelist = DashSet::new();
+        let mint = Pubkey::new_from_array(
+            tx.transaction
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .account_keys[3]
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        )
+        .to_string();
+        whitelist.insert(mint.clone());
+        process_pump_swap_tx(tx, 42, &whitelist, &sender, false)
+            .await
+            .unwrap();
+
+        let mut records = Vec::new();
+        for _ in 0..8 {
+            records.push(receiver.recv().await.unwrap());
+        }
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.instruction_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "buy",
+                "buy_exact_quote_in",
+                "sell",
+                "boost_buy_and_burn",
+                "buy",
+                "buy_exact_quote_in",
+                "sell",
+                "boost_buy_and_burn",
+            ]
+        );
+        for (i, record) in records.iter().enumerate() {
+            let variant = i % 4;
+            assert!(record.success);
+            assert_eq!(record.amount_source, "event");
+            assert_eq!(record.token_amount, 100 + variant as u64);
+            assert_eq!(record.sol_amount, 200 + variant as u64);
+            assert_eq!(record.ix_index, i as i32);
+            assert_eq!(record.is_cpi, i >= 4);
+            assert_eq!(record.slot, 42);
+            assert_eq!(record.mint_address, mint);
+            assert!(!record.is_usdc);
+            assert!(record.market_cap.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn retains_failed_eventless_trade_attempts_from_instruction_bounds() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let tx = fixture(false, true);
+        let whitelist = DashSet::new();
+        let mint = Pubkey::new_from_array(
+            tx.transaction
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .account_keys[3]
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        )
+        .to_string();
+        whitelist.insert(mint);
+        process_pump_swap_tx(tx, 43, &whitelist, &sender, false)
+            .await
+            .unwrap();
+
+        for i in 0..4 {
+            let record = receiver.recv().await.unwrap();
+            assert!(!record.success);
+            assert_eq!(record.amount_source, "instruction_request");
+            let exact_in = matches!(i, 1 | 3);
+            assert_eq!(record.token_amount, if exact_in { 20 + i } else { 10 + i });
+            assert_eq!(
+                record.sol_amount,
+                if i == 0 {
+                    u64::MAX
+                } else if exact_in {
+                    10 + i
+                } else {
+                    20 + i
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_intentional_whitelist_and_pool_safety_filters() {
+        let (sender, mut receiver) = mpsc::channel(32);
+
+        // Canonical but not whitelisted.
+        let tx = fixture(true, false);
+        process_pump_swap_tx(tx, 44, &DashSet::new(), &sender, false)
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+
+        // WSOL-base pools stay excluded even if explicitly whitelisted.
+        let mut tx = fixture(true, false);
+        tx.transaction
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .account_keys[3] = Pubkey::from_str(WSOL_MINT).unwrap().to_bytes().to_vec();
+        let whitelist = DashSet::new();
+        whitelist.insert(WSOL_MINT.to_string());
+        process_pump_swap_tx(tx, 45, &whitelist, &sender, false)
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+
+        // Arbitrary quote mints and noncanonical pool addresses stay excluded.
+        for account_index in [4usize, 0usize] {
+            let mut tx = fixture(true, false);
+            let message = tx.transaction.as_mut().unwrap().message.as_mut().unwrap();
+            let mint = Pubkey::new_from_array(message.account_keys[3].clone().try_into().unwrap())
+                .to_string();
+            message.account_keys[account_index] = Pubkey::new_unique().to_bytes().to_vec();
+            let whitelist = DashSet::new();
+            whitelist.insert(mint);
+            process_pump_swap_tx(tx, 46, &whitelist, &sender, false)
+                .await
+                .unwrap();
+            assert!(receiver.try_recv().is_err());
+        }
+    }
 }

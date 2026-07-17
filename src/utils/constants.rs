@@ -177,9 +177,12 @@ pub const PUMP_SWAP_QUOTE_MINT_IX_POS: usize = 4;
 pub const AMM_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 pub const AMM_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 pub const BUY_EXACT_IN_DISCRIMINATOR: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
+pub const BOOST_BUY_AND_BURN_DISCRIMINATOR: [u8; 8] = [105, 68, 6, 175, 0, 7, 35, 162];
 
 // === PumpSwap Anchor self-CPI event discriminators ===
 /// BuyEvent — emitted for buy / buy_exact_quote_in
 pub const PUMP_SWAP_BUY_EVENT_DISC: [u8; 8] = [103, 244, 82, 31, 44, 245, 119, 119];
 /// SellEvent
 pub const PUMP_SWAP_SELL_EVENT_DISC: [u8; 8] = [62, 47, 55, 10, 165, 3, 220, 42];
+/// BoostBuyAndBurnEvent — protocol-funded buy that changes pool price/reserves.
+pub const PUMP_SWAP_BOOST_BUY_EVENT_DISC: [u8; 8] = [63, 69, 28, 22, 48, 92, 194, 185];

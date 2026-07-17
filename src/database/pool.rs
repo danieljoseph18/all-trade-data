@@ -24,22 +24,19 @@ pub async fn init_pool() -> Result<Arc<Pool>> {
             cfg.dbname = tokio_config.get_dbname().map(|s| s.to_string());
             cfg.application_name = Some("all-trade-data".to_string());
 
-            if let Some(host) = tokio_config.get_hosts().first() {
-                match host {
-                    tokio_postgres::config::Host::Tcp(hostname) => {
-                        cfg.host = Some(hostname.clone());
-                    }
-                    _ => {}
-                }
+            if let Some(tokio_postgres::config::Host::Tcp(hostname)) =
+                tokio_config.get_hosts().first()
+            {
+                cfg.host = Some(hostname.clone());
             }
 
             if let Some(port) = tokio_config.get_ports().first() {
                 cfg.port = Some(*port);
             }
 
-            // max_size 5: this process performs batched inserts on a single task
-            // and an occasional pruner/whitelist refresh, so 5 is enough to absorb
-            // bursts without idle connections piling up at the DB.
+            // max_size 5: this process performs batched inserts on one task,
+            // so this is enough to absorb bursts without idle connections
+            // piling up at the DB.
             cfg.pool = Some(deadpool_postgres::PoolConfig {
                 max_size: 5,
                 timeouts: deadpool_postgres::Timeouts {

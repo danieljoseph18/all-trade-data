@@ -39,3 +39,24 @@ Official Rakurai documentation states that its scheduler uses recognized tip plu
 - `lane_order_summary.csv` and `lane_order_pairs.csv`: full provider evidence.
 - `high_confidence_validator_evidence.csv`: strict empirical subset only.
 - `high_confidence_provider_routes.csv`: strict provider subset only.
+
+## Pump AMM coverage audit
+
+`audit_pump_amm_coverage.py` is an independent, read-only reconciliation of
+finalized Solana RPC transactions against `amm_trades`. It enumerates direct
+and arbitrarily nested CPI invocations of all current Pump AMM trade variants
+(`buy`, `buy_exact_quote_in`, `sell`, and `boost_buy_and_burn`), applies the
+production contract (whitelisted mint, canonical index-0 pool, SOL/USDC quote,
+and non-WSOL base), then compares row count, instruction type, route, pool,
+base/quote mints, user, success, amount source, and exact raw amounts. It exits
+nonzero for any missing, excess, or mismatched qualifying row. Pass
+`--all-pools` only to diagnose intentionally excluded permissionless traffic.
+
+```bash
+python3 analysis/audit_pump_amm_coverage.py --limit 1000 --skip-newest 100
+```
+
+Use `GRPC_FROM_SLOT=<slot>` when starting the collector to request a deeper
+idempotent replay. The configured gRPC provider may retain only a bounded
+history, so use the RPC audit after deployments or prolonged outages rather
+than assuming an old `from_slot` was fully honored.

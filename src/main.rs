@@ -23,40 +23,9 @@ async fn main() -> Result<()> {
 
     dotenv().ok();
 
-    // Kill any existing instance to prevent DB pool contention
-    let pid_file = "/tmp/all-trade-data.pid";
-    let current_pid = std::process::id();
-    if let Ok(old_pid_str) = std::fs::read_to_string(pid_file) {
-        if let Ok(old_pid) = old_pid_str.trim().parse::<u32>() {
-            if old_pid != current_pid {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &old_pid.to_string()])
-                    .output();
-            }
-        }
-    }
-    if let Ok(output) = std::process::Command::new("pgrep")
-        .arg("all-trade-data")
-        .output()
-    {
-        if output.status.success() {
-            for pid_str in String::from_utf8_lossy(&output.stdout).lines() {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    if pid != current_pid {
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &pid.to_string()])
-                            .output();
-                    }
-                }
-            }
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = std::fs::write(pid_file, current_pid.to_string());
-
     utils::setup_logger().expect("Failed to initialize logger");
 
-    // READONLY=true: skip DB writes, bypass whitelist, log every parsed trade.
+    // READONLY=true: skip DB writes and log every parsed trade.
     // Used to validate extraction correctness against an independent RPC source.
     let readonly = std::env::var("READONLY")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -64,7 +33,11 @@ async fn main() -> Result<()> {
 
     info!(
         "Starting All Trade Data collector ({} mode)",
-        if readonly { "READONLY/validation" } else { "write" }
+        if readonly {
+            "READONLY/validation"
+        } else {
+            "write"
+        }
     );
 
     // Shared running flag for graceful shutdown
@@ -83,14 +56,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    // In readonly we skip table creation/migration (DDL is a write) and the
-    // whitelist load (operator wants to see all trades).
+    // In readonly we skip table creation/migration and whitelist loading.
     if !readonly {
         database::ensure_table(&db_pool).await?;
     }
 
     let whitelist = if readonly {
-        info!("READONLY: bypassing whitelist filter — all AMM trades will be logged");
+        info!("READONLY: bypassing whitelist; pool-safety filters remain enabled");
         Arc::new(dashmap::DashSet::new())
     } else {
         info!("Loading whitelisted mints...");
@@ -115,20 +87,36 @@ async fn main() -> Result<()> {
                 receiver,
                 running.clone(),
             )),
-            Some(database::spawn_trade_pruner(db_pool.clone(), running.clone())),
+            Some(database::spawn_trade_pruner(
+                db_pool.clone(),
+                running.clone(),
+            )),
         )
     };
 
     // Create the AMM handler
     let amm_handler = handler::create_amm_handler(whitelist.clone(), sender.clone(), readonly);
 
-    // Grace period for old connections to clean up
-    info!("Waiting 3s for old connections to clean up...");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Replay inclusively from just before the highest durably committed slot.
+    // The request is reused on every reconnect, so anything received but not
+    // committed before a disconnect/crash is delivered again and safely upserted.
+    // GRPC_FROM_SLOT is an explicit override for deeper historical backfills.
+    let replay_from_slot = match std::env::var("GRPC_FROM_SLOT") {
+        Ok(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|e| anyhow::anyhow!("GRPC_FROM_SLOT must be an unsigned slot: {e}"))?,
+        ),
+        Err(_) => database::latest_trade_slot(&db_pool)
+            .await?
+            .map(|slot| slot.saturating_sub(32)),
+    };
 
-    // Initialize gRPC connection
-    info!("Initializing gRPC connection...");
-    let grpc_handle = grpc::init_grpc_connection(amm_handler).await?;
+    info!(
+        "Initializing gRPC connection from slot {:?}...",
+        replay_from_slot
+    );
+    let grpc_handle = grpc::init_grpc_connection(amm_handler, replay_from_slot).await?;
 
     // Listen for shutdown signals
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
@@ -160,7 +148,7 @@ async fn main() -> Result<()> {
     error!("[SHUTDOWN] Aborting gRPC handle...");
     grpc_handle.abort();
 
-    // Step 3: Abort whitelist refresh and trade pruner
+    // Step 3: Stop maintenance tasks.
     if let Some(h) = whitelist_handle {
         error!("[SHUTDOWN] Aborting whitelist refresh...");
         h.abort();

@@ -3,6 +3,7 @@ use futures::StreamExt;
 use log::{error, info};
 use std::collections::HashMap;
 use std::env;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -24,13 +25,14 @@ const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 60;
 
 /// Initialize the gRPC connection and return the JoinHandle for the connection manager task.
-pub async fn init_grpc_connection(
-    handler: impl Fn(SubscribeUpdateTransactionInfo, u64) -> Result<()>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-) -> Result<tokio::task::JoinHandle<()>> {
+pub async fn init_grpc_connection<F, Fut>(
+    handler: F,
+    from_slot: Option<u64>,
+) -> Result<tokio::task::JoinHandle<()>>
+where
+    F: Fn(SubscribeUpdateTransactionInfo, u64) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
     let endpoint = env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT must be set");
 
     let mut filters = HashMap::new();
@@ -49,21 +51,27 @@ pub async fn init_grpc_connection(
         },
     );
 
-    let mut request = SubscribeRequest::default();
-    request.transactions = filters;
-    request.commitment = Some(CommitmentLevel::Confirmed as i32);
+    let request = SubscribeRequest {
+        transactions: filters,
+        // Finalized avoids persisting successful fills from a fork that is
+        // later abandoned (another source of phantom tape/volume).
+        commitment: Some(CommitmentLevel::Finalized as i32),
+        from_slot,
+        ..Default::default()
+    };
 
     let handle = tokio::spawn(manage_connection_with_retry(endpoint, request, handler));
 
     Ok(handle)
 }
 
-async fn manage_connection_with_retry<F>(
+async fn manage_connection_with_retry<F, Fut>(
     endpoint: String,
     request: SubscribeRequest,
     handler: F,
 ) where
-    F: Fn(SubscribeUpdateTransactionInfo, u64) -> Result<()> + Clone + Send + Sync + 'static,
+    F: Fn(SubscribeUpdateTransactionInfo, u64) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send,
 {
     let mut attempt_count = 0;
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
@@ -104,13 +112,14 @@ async fn manage_connection_with_retry<F>(
     }
 }
 
-async fn setup_and_process_stream<F>(
+async fn setup_and_process_stream<F, Fut>(
     endpoint: &str,
     request: SubscribeRequest,
     handler: F,
 ) -> Result<()>
 where
-    F: Fn(SubscribeUpdateTransactionInfo, u64) -> Result<()> + Clone + Send + Sync + 'static,
+    F: Fn(SubscribeUpdateTransactionInfo, u64) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send,
 {
     let mut channel_builder = Channel::from_shared(endpoint.to_string())?;
     if endpoint.starts_with("https://") {
@@ -134,12 +143,13 @@ where
     Ok(())
 }
 
-async fn process_stream<S, F>(mut stream: S, handler: F)
+async fn process_stream<S, F, Fut>(mut stream: S, handler: F)
 where
     S: futures::Stream<
             Item = Result<yellowstone_grpc_proto::geyser::SubscribeUpdate, tonic::Status>,
         > + Unpin,
-    F: Fn(SubscribeUpdateTransactionInfo, u64) -> Result<()> + Clone + Send + Sync + 'static,
+    F: Fn(SubscribeUpdateTransactionInfo, u64) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send,
 {
     info!("[GRPC] gRPC stream started");
 
@@ -147,19 +157,19 @@ where
 
     while let Some(message) = stream.next().await {
         match message {
-            Ok(msg) => match msg.update_oneof {
-                Some(
+            Ok(msg) => {
+                if let Some(
                     yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Transaction(tx),
-                ) => {
+                ) = msg.update_oneof
+                {
                     if let Some(transaction_info) = tx.transaction {
                         let slot = tx.slot;
-                        if let Err(err) = handler(transaction_info, slot) {
+                        if let Err(err) = handler(transaction_info, slot).await {
                             error!("Handler error: {:?}", err);
                         }
                     }
                 }
-                _ => {}
-            },
+            }
             Err(error) => {
                 error!("[GRPC] Stream error: {:?}", error);
                 break;

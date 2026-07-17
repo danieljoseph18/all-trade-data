@@ -17,16 +17,24 @@ use tokio::time::{Duration, interval};
 pub struct TradeRecord {
     pub tx_signature: String,
     pub ix_index: i32,
+    pub pool_address: String,
     pub mint_address: String,
+    pub quote_mint_address: String,
+    pub instruction_type: String,
+    /// `event` is executed volume; `instruction_request` is only a submitted bound.
+    pub amount_source: String,
+    /// True when PumpSwap was invoked by another on-chain program rather than
+    /// as a top-level transaction instruction.
+    pub is_cpi: bool,
     pub user_pubkey: String,
     pub is_buy: bool,
-    pub token_amount: i64,
+    pub token_amount: u64,
     /// Quote amount in native pool units: lamports for SOL pools, USDC
     /// microunits for USDC pools (`is_usdc = true`).
-    pub sol_amount: i64,
+    pub sol_amount: u64,
     /// Market cap in native pool quote units. `None` for failed trades, which
     /// carry no executed event payload to derive reserves/price from.
-    pub market_cap: Option<i64>,
+    pub market_cap: Option<u64>,
     pub is_usdc: bool,
     /// Whether the transaction landed. `false` rows are attempted trades that
     /// failed on-chain; their `token_amount`/`sol_amount` are the *requested*
@@ -57,12 +65,17 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             "CREATE TABLE IF NOT EXISTS amm_trades (
                 tx_signature TEXT NOT NULL,
                 ix_index INTEGER NOT NULL DEFAULT 0,
+                pool_address TEXT NOT NULL DEFAULT '',
                 mint_address TEXT NOT NULL,
+                quote_mint_address TEXT NOT NULL DEFAULT 'So11111111111111111111111111111111111111112',
+                instruction_type TEXT NOT NULL DEFAULT 'unknown',
+                amount_source TEXT NOT NULL DEFAULT 'event',
+                is_cpi BOOLEAN NOT NULL DEFAULT FALSE,
                 user_pubkey TEXT NOT NULL,
                 is_buy BOOLEAN NOT NULL,
-                token_amount BIGINT NOT NULL,
-                sol_amount BIGINT NOT NULL,
-                market_cap BIGINT,
+                token_amount NUMERIC(20,0) NOT NULL,
+                sol_amount NUMERIC(20,0) NOT NULL,
+                market_cap NUMERIC(20,0),
                 is_usdc BOOLEAN NOT NULL DEFAULT FALSE,
                 success BOOLEAN NOT NULL DEFAULT TRUE,
                 slot BIGINT NOT NULL,
@@ -76,6 +89,11 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             );
 
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS ix_index INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS pool_address TEXT NOT NULL DEFAULT '';
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS quote_mint_address TEXT NOT NULL DEFAULT 'So11111111111111111111111111111111111111112';
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS instruction_type TEXT NOT NULL DEFAULT 'unknown';
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS amount_source TEXT NOT NULL DEFAULT 'event';
+            ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS is_cpi BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS priority_fee BIGINT;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS transfer_tip BIGINT;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS tip_provider TEXT;
@@ -83,6 +101,31 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS success BOOLEAN NOT NULL DEFAULT TRUE;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS compute_units_consumed BIGINT;
             ALTER TABLE amm_trades ADD COLUMN IF NOT EXISTS lamports_per_compute_unit DOUBLE PRECISION;
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'amm_trades'
+                      AND column_name = 'token_amount'
+                      AND data_type <> 'numeric'
+                ) THEN
+                    ALTER TABLE amm_trades ALTER COLUMN token_amount TYPE NUMERIC(20,0) USING token_amount::numeric;
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'amm_trades'
+                      AND column_name = 'sol_amount' AND data_type <> 'numeric'
+                ) THEN
+                    ALTER TABLE amm_trades ALTER COLUMN sol_amount TYPE NUMERIC(20,0) USING sol_amount::numeric;
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = 'amm_trades'
+                      AND column_name = 'market_cap' AND data_type <> 'numeric'
+                ) THEN
+                    ALTER TABLE amm_trades ALTER COLUMN market_cap TYPE NUMERIC(20,0) USING market_cap::numeric;
+                END IF;
+            END$$;
 
             DO $$
             DECLARE
@@ -99,6 +142,8 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
             END$$;
 
             CREATE INDEX IF NOT EXISTS idx_amm_trades_mint ON amm_trades(mint_address);
+            CREATE INDEX IF NOT EXISTS idx_amm_trades_pool ON amm_trades(pool_address);
+            CREATE INDEX IF NOT EXISTS idx_amm_trades_quote_mint ON amm_trades(quote_mint_address);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_slot ON amm_trades(slot);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_user ON amm_trades(user_pubkey);
             CREATE INDEX IF NOT EXISTS idx_amm_trades_created_at ON amm_trades(created_at);
@@ -110,7 +155,19 @@ pub async fn ensure_table(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
-/// Batch insert trades using a parameterized query with ON CONFLICT DO NOTHING.
+/// Highest durably committed slot, used as an inclusive reconnect/restart
+/// replay checkpoint. Replaying a safety window is harmless because inserts
+/// are idempotent upserts.
+pub async fn latest_trade_slot(pool: &Pool) -> Result<Option<u64>> {
+    let client = pool.get().await?;
+    let row = client
+        .query_one("SELECT MAX(slot) FROM amm_trades", &[])
+        .await?;
+    let slot: Option<i64> = row.get(0);
+    Ok(slot.and_then(|value| u64::try_from(value).ok()))
+}
+
+/// Batch insert trades using a parameterized, idempotent upsert.
 ///
 /// Uses a single client checked out from the pool for the whole batch — callers
 /// chunking large flushes should call this once per chunk, not hold their own
@@ -122,15 +179,27 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
 
     let client = pool.get().await?;
 
-    const COLS: usize = 17;
+    const COLS: usize = 22;
     let mut query_parts = Vec::with_capacity(trades.len());
+    let token_amounts: Vec<String> = trades
+        .iter()
+        .map(|trade| trade.token_amount.to_string())
+        .collect();
+    let quote_amounts: Vec<String> = trades
+        .iter()
+        .map(|trade| trade.sol_amount.to_string())
+        .collect();
+    let market_caps: Vec<Option<String>> = trades
+        .iter()
+        .map(|trade| trade.market_cap.map(|value| value.to_string()))
+        .collect();
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         Vec::with_capacity(trades.len() * COLS);
 
     for (i, trade) in trades.iter().enumerate() {
         let base_idx = i * COLS;
         query_parts.push(format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::text::numeric, ${}::text::numeric, ${}::text::numeric, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
             base_idx + 1,
             base_idx + 2,
             base_idx + 3,
@@ -148,16 +217,26 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
             base_idx + 15,
             base_idx + 16,
             base_idx + 17,
+            base_idx + 18,
+            base_idx + 19,
+            base_idx + 20,
+            base_idx + 21,
+            base_idx + 22,
         ));
 
         params.push(&trade.tx_signature);
         params.push(&trade.ix_index);
+        params.push(&trade.pool_address);
         params.push(&trade.mint_address);
+        params.push(&trade.quote_mint_address);
+        params.push(&trade.instruction_type);
+        params.push(&trade.amount_source);
+        params.push(&trade.is_cpi);
         params.push(&trade.user_pubkey);
         params.push(&trade.is_buy);
-        params.push(&trade.token_amount);
-        params.push(&trade.sol_amount);
-        params.push(&trade.market_cap);
+        params.push(&token_amounts[i]);
+        params.push(&quote_amounts[i]);
+        params.push(&market_caps[i]);
         params.push(&trade.is_usdc);
         params.push(&trade.success);
         params.push(&trade.slot);
@@ -170,7 +249,17 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     }
 
     let query = format!(
-        "INSERT INTO amm_trades (tx_signature, ix_index, mint_address, user_pubkey, is_buy, token_amount, sol_amount, market_cap, is_usdc, success, slot, created_at, priority_fee, transfer_tip, tip_provider, compute_units_consumed, lamports_per_compute_unit) VALUES {} ON CONFLICT (tx_signature, ix_index) DO NOTHING",
+        "INSERT INTO amm_trades (tx_signature, ix_index, pool_address, mint_address, quote_mint_address, instruction_type, amount_source, is_cpi, user_pubkey, is_buy, token_amount, sol_amount, market_cap, is_usdc, success, slot, created_at, priority_fee, transfer_tip, tip_provider, compute_units_consumed, lamports_per_compute_unit) VALUES {} \
+         ON CONFLICT (tx_signature, ix_index) DO UPDATE SET \
+         pool_address = EXCLUDED.pool_address, mint_address = EXCLUDED.mint_address, \
+         quote_mint_address = EXCLUDED.quote_mint_address, instruction_type = EXCLUDED.instruction_type, \
+         amount_source = EXCLUDED.amount_source, is_cpi = EXCLUDED.is_cpi, user_pubkey = EXCLUDED.user_pubkey, \
+         is_buy = EXCLUDED.is_buy, token_amount = EXCLUDED.token_amount, \
+         sol_amount = EXCLUDED.sol_amount, market_cap = EXCLUDED.market_cap, \
+         is_usdc = EXCLUDED.is_usdc, success = EXCLUDED.success, slot = EXCLUDED.slot, \
+         priority_fee = EXCLUDED.priority_fee, transfer_tip = EXCLUDED.transfer_tip, \
+         tip_provider = EXCLUDED.tip_provider, compute_units_consumed = EXCLUDED.compute_units_consumed, \
+         lamports_per_compute_unit = EXCLUDED.lamports_per_compute_unit",
         query_parts.join(",")
     );
 
@@ -204,7 +293,7 @@ pub fn spawn_batch_inserter(
                     match trade {
                         Some(record) => {
                             buffer.push(record);
-                            if buffer.len() >= 500 {
+                            if buffer.len() == 500 {
                                 flush_buffer(&pool, &mut buffer).await;
                             }
                         }
@@ -232,7 +321,7 @@ pub fn spawn_batch_inserter(
     })
 }
 
-/// Delete trades older than 14 days.
+/// Delete records outside the intentional rolling 14-day retention window.
 pub async fn prune_old_trades(pool: &Pool) -> Result<u64> {
     let client = pool.get().await?;
     let rows = client
@@ -244,14 +333,13 @@ pub async fn prune_old_trades(pool: &Pool) -> Result<u64> {
     Ok(rows)
 }
 
-/// Spawn a background task that prunes old trades every hour.
 pub fn spawn_trade_pruner(
     pool: Arc<Pool>,
     running: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(3600));
-        ticker.tick().await; // skip first immediate tick
+        ticker.tick().await;
         while running.load(Ordering::Relaxed) {
             ticker.tick().await;
             match prune_old_trades(&pool).await {
@@ -264,19 +352,25 @@ pub fn spawn_trade_pruner(
 }
 
 async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
-    let count = buffer.len();
+    let pending = std::mem::take(buffer);
+    let count = pending.len();
+    let mut retry = Vec::new();
 
     // Chunks of 500 keep us well under the 65,535 bound parameter limit
-    // (500 * 17 = 8,500).
-    for chunk in buffer.chunks(500) {
+    // (500 * 22 = 11,000).
+    for chunk in pending.chunks(500) {
         if let Err(e) = batch_insert_trades(pool, chunk).await {
             warn!("Failed to batch insert {} trades: {:?}", chunk.len(), e);
+            retry.extend_from_slice(chunk);
         }
     }
 
     if count > 0 {
-        info!("Flushed {} trades to database", count);
+        info!(
+            "Flushed {} trades to database; {} retained for retry",
+            count - retry.len(),
+            retry.len()
+        );
     }
-
-    buffer.clear();
+    buffer.extend(retry);
 }

@@ -65,29 +65,37 @@ pub fn resolve_mint_from_instr(
     Some(Pubkey::new_from_array(arr).to_string())
 }
 
-/// Resolve the memecoin mint from a pump_swap instruction, skipping non-canonical
-/// "scam" pools where `base_mint == WSOL`. Those pools invert the base/quote
-/// semantics, so every downstream reserve/fee/market-cap computation would be
-/// garbage.
+/// Resolve the base mint from any PumpSwap trade instruction.
 pub fn resolve_pump_swap_memecoin(
     instr: &CompiledInstruction,
     full_accounts: &[Vec<u8>],
 ) -> Option<String> {
-    let mint = resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_MINT_IX_POS)?;
-    if mint.as_str() == WSOL_MINT {
-        return None;
-    }
-    Some(mint)
+    resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_MINT_IX_POS)
 }
 
-/// Classify the quote mint of a pump_swap instruction. Returns `None` for
-/// unsupported quote mints.
-pub fn pump_swap_quote_currency(
+/// Resolve the quote mint from any PumpSwap trade instruction.
+pub fn resolve_pump_swap_quote_mint(
     instr: &CompiledInstruction,
     full_accounts: &[Vec<u8>],
-) -> Option<QuoteCurrency> {
-    let mint = resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS)?;
-    quote_currency_of(&mint)
+) -> Option<String> {
+    resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS)
+}
+
+/// Resolve the pool from any PumpSwap trade instruction.
+pub fn resolve_pump_swap_pool(
+    instr: &CompiledInstruction,
+    full_accounts: &[Vec<u8>],
+) -> Option<String> {
+    resolve_mint_from_instr(instr, full_accounts, PUMP_SWAP_POOL_IX_POS)
+}
+
+/// Resolve an arbitrary instruction account as a base58 pubkey.
+pub fn resolve_instruction_account(
+    instr: &CompiledInstruction,
+    full_accounts: &[Vec<u8>],
+    position: usize,
+) -> Option<String> {
+    resolve_mint_from_instr(instr, full_accounts, position)
 }
 
 /// Verify that a PumpSwap trade targets the canonical index-0 pool created by
@@ -166,6 +174,7 @@ pub fn find_event_data<'a>(
     meta: &'a TransactionStatusMeta,
     parent_outer_idx: usize,
     start_inner_pos: usize,
+    pump_swap_program_index: u32,
     event_disc: &[u8; 8],
 ) -> Option<&'a [u8]> {
     let block = meta
@@ -191,6 +200,17 @@ pub fn find_event_data<'a>(
             if h <= trade_stack {
                 break;
             }
+            // Anchor's emit_cpi! is a direct child of the trade invocation.
+            // Ignoring depth can attribute a nested trade's event to its
+            // ancestor when a custom program recursively invokes PumpSwap.
+            if h != trade_stack + 1 {
+                continue;
+            }
+        }
+        // The event must be PumpSwap's self-CPI, not arbitrary instruction
+        // data crafted by another program with the same 8-byte discriminator.
+        if ix.program_id_index != pump_swap_program_index {
+            continue;
         }
         let data = ix.data.as_slice();
         if data.len() >= 16 && &data[8..16] == event_disc {
@@ -198,14 +218,6 @@ pub fn find_event_data<'a>(
         }
     }
     None
-}
-
-/// Returns the user (signer) pubkey as a bs58-encoded string.
-pub fn get_user(account_keys: &[Vec<u8>]) -> String {
-    if account_keys.is_empty() {
-        return "unknown".to_string();
-    }
-    bs58::encode(&account_keys[0]).into_string()
 }
 
 // All offsets below are relative to the event discriminator start (data[0..8]),
@@ -266,6 +278,30 @@ pub fn extract_quote_volume(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     let sell = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
     let buy = u64::from_le_bytes(bytes[112..120].try_into().unwrap());
     (Some(buy), Some(sell))
+}
+
+/// Decode the stable prefix of BoostBuyAndBurnEvent.
+/// Returns `(base_burned, quote_used, base_reserves_after, effective_quote_after)`.
+pub fn extract_boost_buy_event(bytes: &[u8]) -> Option<(u64, u64, u64, u64)> {
+    if bytes.len() < 200 {
+        return None;
+    }
+    let quote_used = u64::from_le_bytes(bytes[152..160].try_into().ok()?);
+    let base_burned = u64::from_le_bytes(bytes[160..168].try_into().ok()?);
+    let virtual_quote = i128::from_le_bytes(bytes[168..184].try_into().ok()?);
+    let real_quote = u64::from_le_bytes(bytes[184..192].try_into().ok()?);
+    let base_after = u64::from_le_bytes(bytes[192..200].try_into().ok()?);
+    let effective_quote = (i128::from(real_quote) + virtual_quote).max(0) as u64;
+    Some((base_burned, quote_used, base_after, effective_quote))
+}
+
+/// Compute market cap from post-trade reserves without applying a trade delta.
+pub fn get_market_cap_from_reserves(
+    base_reserves: u64,
+    quote_reserves: u64,
+    quote_currency: QuoteCurrency,
+) -> u64 {
+    get_market_cap_in_quote(base_reserves, quote_reserves, 0, 0, false, quote_currency)
 }
 
 /// Collects all instructions (direct + CPI) for a specific program ID from a transaction.
@@ -595,7 +631,7 @@ mod tests {
         };
 
         assert_eq!(
-            find_event_data(&meta, 2, 1, &event_disc).map(|data| &data[..8]),
+            find_event_data(&meta, 2, 1, 7, &event_disc).map(|data| &data[..8]),
             Some(event_disc.as_slice()),
         );
     }
@@ -633,6 +669,6 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(find_event_data(&meta, 1, 1, &event_disc).is_none());
+        assert!(find_event_data(&meta, 1, 1, 7, &event_disc).is_none());
     }
 }
