@@ -224,6 +224,10 @@ pub fn find_event_data<'a>(
 // matching the layout of PumpSwap BuyEvent / SellEvent.
 
 /// PumpSwap pool reserves: pool_base at 48, pool_quote at 56.
+///
+/// The quote value is the RAW quote-vault balance. Since the 2026-07-15 pool
+/// upgrade that is no longer the pricing basis — pair it with
+/// `extract_pump_swap_virtual_quote_reserves` and `effective_quote_reserves`.
 pub fn extract_pool_reserves_from_data(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     if bytes.len() < 64 {
         return (None, None);
@@ -231,6 +235,92 @@ pub fn extract_pool_reserves_from_data(bytes: &[u8]) -> (Option<u64>, Option<u64
     let base = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
     let quote = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
     (Some(base), Some(quote))
+}
+
+// === PumpSwap virtual quote reserves (appended 2026-07-15) ===
+//
+// Frozen against pump-fun/pump-public-docs `idl/pump_amm.json` @ 2c22246
+// ("feat: pool virtual quotes reserves"), the same upgrade that introduced
+// `boost_buy_and_burn`. It *appended* `virtual_quote_reserves` (i128),
+// `can_boost` (bool) and `base_supply` (u64) to BuyEvent / SellEvent; no
+// pre-existing field moved, so every offset above this line is unchanged.
+//
+// BuyEvent and SellEvent share a fixed prefix only through `coin_creator_fee`
+// (offset 352), then diverge:
+//
+//   BuyEvent   360 track_volume(bool) 361 total_unclaimed_tokens
+//              369 total_claimed_tokens 377 current_sol_volume
+//              385 last_update_timestamp 393 min_base_amount_out
+//              401 ix_name (VARIABLE-LENGTH Borsh string)
+//              then cashback_fee_basis_points, cashback,
+//                   buyback_fee_basis_points, buyback_fee, then the field.
+//
+//   SellEvent  360 cashback_fee_basis_points 368 cashback
+//              376 buyback_fee_basis_points 384 buyback_fee
+//              392 virtual_quote_reserves
+//
+// So SellEvent reads at a fixed offset while BuyEvent needs a walker past
+// `ix_name`; the two cannot share one offset constant.
+
+/// SellEvent `virtual_quote_reserves` (i128) — fixed offset.
+pub const PUMP_SWAP_SELL_VQR_OFFSET: usize = 392;
+/// BuyEvent fixed-prefix length; the variable-length `ix_name` starts here.
+pub const PUMP_SWAP_BUY_IX_NAME_OFFSET: usize = 401;
+/// BuyEvent scalars between `ix_name` and `virtual_quote_reserves`:
+/// cashback_fee_basis_points, cashback, buyback_fee_basis_points, buyback_fee.
+const PUMP_SWAP_BUY_POST_IX_NAME_SCALARS: usize = 8 * 4;
+
+/// PumpSwap `virtual_quote_reserves` for a buy or sell event.
+///
+/// Signed (`i128`): the value is an *adjustment* to the quote side, so it is
+/// not safe to decode as a `u64`. Returns `None` for a pre-upgrade (or
+/// truncated) payload, which callers treat as "no virtual reserves".
+///
+/// `is_buy` selects the layout; passing the wrong one reads unrelated bytes,
+/// so it must match the discriminator the payload was located by.
+pub fn extract_pump_swap_virtual_quote_reserves(bytes: &[u8], is_buy: bool) -> Option<i128> {
+    let p = if is_buy {
+        let mut p = PUMP_SWAP_BUY_IX_NAME_OFFSET;
+        // ix_name (Borsh string = u32 length + bytes)
+        if p.checked_add(4)? > bytes.len() {
+            return None;
+        }
+        let ix_name_len = u32::from_le_bytes(bytes[p..p + 4].try_into().ok()?) as usize;
+        p = p.checked_add(4)?.checked_add(ix_name_len)?;
+        p.checked_add(PUMP_SWAP_BUY_POST_IX_NAME_SCALARS)?
+    } else {
+        PUMP_SWAP_SELL_VQR_OFFSET
+    };
+    if p.checked_add(16)? > bytes.len() {
+        return None;
+    }
+    Some(i128::from_le_bytes(bytes[p..p + 16].try_into().ok()?))
+}
+
+/// PumpSwap effective quote reserves — what buys and sells are actually priced
+/// against since the 2026-07-15 pool upgrade:
+///
+/// ```text
+/// effective_quote_reserves = pool_quote_token_account.amount + Pool::virtual_quote_reserves
+/// ```
+///
+/// `virtual_quote_reserves` is signed and may be absent (pre-upgrade payload,
+/// or a non-launchpad pool that never carries one), in which case effective
+/// reserves are just the raw vault balance. A negative adjustment that would
+/// take the pool below zero is clamped — a non-positive quote side has no
+/// meaningful price, and `get_market_cap_in_quote` already returns 0 there.
+///
+/// The base side is unchanged: base reserves stay the raw vault balance.
+pub fn effective_quote_reserves(
+    raw_quote_reserves: u64,
+    virtual_quote_reserves: Option<i128>,
+) -> u64 {
+    match virtual_quote_reserves {
+        Some(virtual_reserves) => (raw_quote_reserves as i128)
+            .saturating_add(virtual_reserves)
+            .clamp(0, u64::MAX as i128) as u64,
+        None => raw_quote_reserves,
+    }
 }
 
 /// PumpSwap base token amount: base_amount_out@16 (BuyEvent) or base_amount_in@16 (SellEvent).
@@ -291,7 +381,7 @@ pub fn extract_boost_buy_event(bytes: &[u8]) -> Option<(u64, u64, u64, u64)> {
     let virtual_quote = i128::from_le_bytes(bytes[168..184].try_into().ok()?);
     let real_quote = u64::from_le_bytes(bytes[184..192].try_into().ok()?);
     let base_after = u64::from_le_bytes(bytes[192..200].try_into().ok()?);
-    let effective_quote = (i128::from(real_quote) + virtual_quote).max(0) as u64;
+    let effective_quote = effective_quote_reserves(real_quote, Some(virtual_quote));
     Some((base_burned, quote_used, base_after, effective_quote))
 }
 
@@ -510,7 +600,7 @@ mod tests {
     use super::*;
     use crate::utils::{
         AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID,
-        PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID,
+        PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
     };
     use std::str::FromStr;
     use yellowstone_grpc_proto::prelude::{InnerInstruction, InnerInstructions};
@@ -670,5 +760,345 @@ mod tests {
         };
 
         assert!(find_event_data(&meta, 1, 1, 7, &event_disc).is_none());
+    }
+
+    // === PumpSwap event decoding ===
+
+    /// Fields a synthetic PumpSwap event carries. Everything not named here is
+    /// zero-filled; the builders place each field at its IDL offset.
+    #[derive(Default, Clone)]
+    struct PumpSwapEventFields {
+        /// base_amount_out (buy) / base_amount_in (sell) @16
+        base_amount: u64,
+        /// @48
+        pool_base_token_reserves: u64,
+        /// @56 — the RAW quote-vault balance, not the effective reserves.
+        pool_quote_token_reserves: u64,
+        /// quote_amount_in (buy) / quote_amount_out (sell) @64
+        quote_amount: u64,
+        /// user_quote_amount_in (buy) / user_quote_amount_out (sell) @112
+        user_quote_amount: u64,
+        /// BuyEvent only — variable-length, which is what forces the walker.
+        ix_name: String,
+        /// Appended 2026-07-15. Signed.
+        virtual_quote_reserves: i128,
+        /// Appended 2026-07-15.
+        base_supply: u64,
+    }
+
+    /// Bytes shared by BuyEvent and SellEvent: the event discriminator through
+    /// `coin_creator_fee` @352, where the two layouts diverge.
+    fn build_pump_swap_common_prefix(disc: &[u8; 8], f: &PumpSwapEventFields) -> Vec<u8> {
+        let mut b = Vec::with_capacity(512);
+        b.extend_from_slice(disc);
+        b.extend_from_slice(&0i64.to_le_bytes()); // 8   timestamp
+        b.extend_from_slice(&f.base_amount.to_le_bytes()); // 16  base_amount_{out,in}
+        b.extend_from_slice(&0u64.to_le_bytes()); // 24  {max,min}_quote_amount
+        b.extend_from_slice(&0u64.to_le_bytes()); // 32  user_base_token_reserves
+        b.extend_from_slice(&0u64.to_le_bytes()); // 40  user_quote_token_reserves
+        assert_eq!(b.len(), 48, "pool_base_token_reserves offset");
+        b.extend_from_slice(&f.pool_base_token_reserves.to_le_bytes()); // 48
+        b.extend_from_slice(&f.pool_quote_token_reserves.to_le_bytes()); // 56
+        assert_eq!(b.len(), 64, "quote_amount offset");
+        b.extend_from_slice(&f.quote_amount.to_le_bytes()); // 64
+        b.extend_from_slice(&0u64.to_le_bytes()); // 72  lp_fee_basis_points
+        b.extend_from_slice(&0u64.to_le_bytes()); // 80  lp_fee
+        b.extend_from_slice(&0u64.to_le_bytes()); // 88  protocol_fee_basis_points
+        b.extend_from_slice(&0u64.to_le_bytes()); // 96  protocol_fee
+        b.extend_from_slice(&0u64.to_le_bytes()); // 104 quote_amount_*_lp_fee
+        assert_eq!(b.len(), 112, "user_quote_amount offset");
+        b.extend_from_slice(&f.user_quote_amount.to_le_bytes()); // 112
+        // 120 pool, 152 user, 184 user_base_ta, 216 user_quote_ta,
+        // 248 protocol_fee_recipient, 280 protocol_fee_recipient_ta
+        b.extend(std::iter::repeat_n(0u8, 32 * 6));
+        assert_eq!(b.len(), 312, "coin_creator offset");
+        b.extend(std::iter::repeat_n(0u8, 32)); // 312 coin_creator
+        b.extend_from_slice(&0u64.to_le_bytes()); // 344 coin_creator_fee_basis_points
+        b.extend_from_slice(&0u64.to_le_bytes()); // 352 coin_creator_fee
+        assert_eq!(b.len(), 360, "end of shared prefix");
+        b
+    }
+
+    /// Synthetic BuyEvent matching `idl/pump_amm.json` @ 2c22246.
+    /// `with_appended_fields = false` reproduces a pre-2026-07-15 payload.
+    fn build_pump_swap_buy_event(f: &PumpSwapEventFields, with_appended_fields: bool) -> Vec<u8> {
+        let mut b = build_pump_swap_common_prefix(&PUMP_SWAP_BUY_EVENT_DISC, f);
+        b.push(0); // 360 track_volume (bool)
+        b.extend_from_slice(&0u64.to_le_bytes()); // 361 total_unclaimed_tokens
+        b.extend_from_slice(&0u64.to_le_bytes()); // 369 total_claimed_tokens
+        b.extend_from_slice(&0u64.to_le_bytes()); // 377 current_sol_volume
+        b.extend_from_slice(&0i64.to_le_bytes()); // 385 last_update_timestamp
+        b.extend_from_slice(&0u64.to_le_bytes()); // 393 min_base_amount_out
+        assert_eq!(b.len(), PUMP_SWAP_BUY_IX_NAME_OFFSET, "ix_name offset");
+        b.extend_from_slice(&(f.ix_name.len() as u32).to_le_bytes());
+        b.extend_from_slice(f.ix_name.as_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // cashback_fee_basis_points
+        b.extend_from_slice(&0u64.to_le_bytes()); // cashback
+        b.extend_from_slice(&0u64.to_le_bytes()); // buyback_fee_basis_points
+        b.extend_from_slice(&0u64.to_le_bytes()); // buyback_fee
+        if with_appended_fields {
+            b.extend_from_slice(&f.virtual_quote_reserves.to_le_bytes());
+            b.push(0); // can_boost
+            b.extend_from_slice(&f.base_supply.to_le_bytes());
+        }
+        b
+    }
+
+    /// Synthetic SellEvent matching `idl/pump_amm.json` @ 2c22246.
+    /// Unlike BuyEvent this layout is fully fixed-size.
+    fn build_pump_swap_sell_event(f: &PumpSwapEventFields, with_appended_fields: bool) -> Vec<u8> {
+        let mut b = build_pump_swap_common_prefix(&PUMP_SWAP_SELL_EVENT_DISC, f);
+        b.extend_from_slice(&0u64.to_le_bytes()); // 360 cashback_fee_basis_points
+        b.extend_from_slice(&0u64.to_le_bytes()); // 368 cashback
+        b.extend_from_slice(&0u64.to_le_bytes()); // 376 buyback_fee_basis_points
+        b.extend_from_slice(&0u64.to_le_bytes()); // 384 buyback_fee
+        assert_eq!(
+            b.len(),
+            PUMP_SWAP_SELL_VQR_OFFSET,
+            "virtual_quote_reserves offset"
+        );
+        if with_appended_fields {
+            b.extend_from_slice(&f.virtual_quote_reserves.to_le_bytes()); // 392
+            b.push(0); // 408 can_boost
+            b.extend_from_slice(&f.base_supply.to_le_bytes()); // 409
+        }
+        b
+    }
+
+    /// Realistic freshly-migrated pump.fun pool: ~85 SOL of real quote against
+    /// ~206.9M tokens, plus the kind of virtual top-up phase 2 introduces.
+    fn migrated_pool_fields() -> PumpSwapEventFields {
+        PumpSwapEventFields {
+            base_amount: 1_000_000_000,
+            pool_base_token_reserves: 206_900_000_000_000,
+            pool_quote_token_reserves: 85_000_000_000, // 85 SOL raw
+            quote_amount: 500_000_000,
+            user_quote_amount: 505_000_000,
+            ix_name: "buy".to_string(),
+            virtual_quote_reserves: 30_000_000_000, // 30 SOL virtual
+            base_supply: 1_000_000_000_000_000,
+        }
+    }
+
+    /// Offsets are frozen against the IDL; the builders assert them
+    /// structurally, this pins the constants the decoder itself uses.
+    #[test]
+    fn pump_swap_vqr_offsets_match_idl() {
+        assert_eq!(PUMP_SWAP_SELL_VQR_OFFSET, 392);
+        assert_eq!(PUMP_SWAP_BUY_IX_NAME_OFFSET, 401);
+        assert_eq!(PUMP_SWAP_BUY_POST_IX_NAME_SCALARS, 32);
+    }
+
+    #[test]
+    fn pump_swap_sell_event_reads_virtual_quote_reserves() {
+        let bytes = build_pump_swap_sell_event(&migrated_pool_fields(), true);
+        assert_eq!(
+            extract_pump_swap_virtual_quote_reserves(&bytes, false),
+            Some(30_000_000_000)
+        );
+    }
+
+    /// The BuyEvent walker must land on the same field regardless of how long
+    /// `ix_name` is — the reason a fixed offset cannot be used there.
+    #[test]
+    fn pump_swap_buy_event_walks_variable_length_ix_name() {
+        for ix_name in ["", "buy", "buy_exact_quote_in", &"x".repeat(255)] {
+            let f = PumpSwapEventFields {
+                ix_name: ix_name.to_string(),
+                ..migrated_pool_fields()
+            };
+            let bytes = build_pump_swap_buy_event(&f, true);
+            assert_eq!(
+                extract_pump_swap_virtual_quote_reserves(&bytes, true),
+                Some(30_000_000_000),
+                "ix_name len {}",
+                ix_name.len()
+            );
+        }
+    }
+
+    /// The field is `i128`, so a negative adjustment must survive decoding
+    /// rather than wrapping into a huge positive number.
+    #[test]
+    fn pump_swap_virtual_quote_reserves_decodes_negative() {
+        let f = PumpSwapEventFields {
+            virtual_quote_reserves: -5_000_000_000,
+            ..migrated_pool_fields()
+        };
+        assert_eq!(
+            extract_pump_swap_virtual_quote_reserves(&build_pump_swap_buy_event(&f, true), true),
+            Some(-5_000_000_000)
+        );
+        assert_eq!(
+            extract_pump_swap_virtual_quote_reserves(&build_pump_swap_sell_event(&f, true), false),
+            Some(-5_000_000_000)
+        );
+    }
+
+    /// A pre-2026-07-15 payload has no appended fields — decode must degrade to
+    /// None (treated as "no virtual reserves") rather than reading garbage.
+    #[test]
+    fn pump_swap_virtual_quote_reserves_none_on_pre_upgrade_payload() {
+        let f = migrated_pool_fields();
+        assert_eq!(
+            extract_pump_swap_virtual_quote_reserves(&build_pump_swap_buy_event(&f, false), true),
+            None
+        );
+        assert_eq!(
+            extract_pump_swap_virtual_quote_reserves(&build_pump_swap_sell_event(&f, false), false),
+            None
+        );
+    }
+
+    /// The layouts diverge after offset 352, so the buy/sell flag must match
+    /// the discriminator the payload was found by.
+    #[test]
+    fn pump_swap_virtual_quote_reserves_wrong_layout_does_not_alias() {
+        let f = migrated_pool_fields();
+        assert_ne!(
+            extract_pump_swap_virtual_quote_reserves(&build_pump_swap_sell_event(&f, true), true),
+            Some(30_000_000_000)
+        );
+        assert_ne!(
+            extract_pump_swap_virtual_quote_reserves(&build_pump_swap_buy_event(&f, true), false),
+            Some(30_000_000_000)
+        );
+    }
+
+    /// A corrupt / hostile ix_name length must not panic or index out of bounds.
+    #[test]
+    fn pump_swap_virtual_quote_reserves_survives_absurd_ix_name_len() {
+        let mut bytes = build_pump_swap_buy_event(&migrated_pool_fields(), true);
+        let p = PUMP_SWAP_BUY_IX_NAME_OFFSET;
+        bytes[p..p + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(extract_pump_swap_virtual_quote_reserves(&bytes, true), None);
+    }
+
+    /// Every truncation of a valid payload must return None, never panic.
+    #[test]
+    fn pump_swap_decoders_never_panic_on_truncated_payloads() {
+        let f = migrated_pool_fields();
+        for full in [
+            build_pump_swap_buy_event(&f, true),
+            build_pump_swap_sell_event(&f, true),
+        ] {
+            for len in 0..full.len() {
+                let bytes = &full[..len];
+                let _ = extract_pump_swap_virtual_quote_reserves(bytes, true);
+                let _ = extract_pump_swap_virtual_quote_reserves(bytes, false);
+                let _ = extract_pool_reserves_from_data(bytes);
+                let _ = extract_quote_volume(bytes);
+                let _ = extract_transaction_amounts(bytes);
+                let _ = extract_boost_buy_event(bytes);
+            }
+        }
+    }
+
+    /// Regression guard for the 2026-07-15 upgrade: the new BuyEvent/SellEvent
+    /// fields were *appended*, so every pre-existing decoder must still read
+    /// its field correctly out of a new-format payload. If pump ever inserts a
+    /// field mid-struct instead, this is what catches it.
+    #[test]
+    fn pump_swap_appended_fields_do_not_shift_existing_offsets() {
+        let f = migrated_pool_fields();
+        for (bytes, is_buy) in [
+            (build_pump_swap_buy_event(&f, true), true),
+            (build_pump_swap_sell_event(&f, true), false),
+        ] {
+            assert_eq!(
+                extract_pool_reserves_from_data(&bytes),
+                (Some(206_900_000_000_000), Some(85_000_000_000)),
+                "pool reserves (is_buy={is_buy})"
+            );
+            assert_eq!(
+                extract_transaction_amounts(&bytes),
+                Some(1_000_000_000),
+                "base amount (is_buy={is_buy})"
+            );
+            let (buy_vol, sell_vol) = extract_quote_volume(&bytes);
+            assert_eq!(buy_vol, Some(505_000_000), "buy volume (is_buy={is_buy})");
+            assert_eq!(sell_vol, Some(500_000_000), "sell volume (is_buy={is_buy})");
+        }
+    }
+
+    // === effective quote reserves ===
+
+    const RAW_QUOTE: u64 = 85_000_000_000;
+
+    #[test]
+    fn effective_quote_reserves_absent_field_is_raw_balance() {
+        assert_eq!(effective_quote_reserves(RAW_QUOTE, None), RAW_QUOTE);
+    }
+
+    /// Phase 1 shipped the field as 0 on every pool, so it must be a no-op.
+    #[test]
+    fn effective_quote_reserves_zero_is_no_op() {
+        assert_eq!(effective_quote_reserves(RAW_QUOTE, Some(0)), RAW_QUOTE);
+    }
+
+    #[test]
+    fn effective_quote_reserves_applies_signed_adjustment() {
+        assert_eq!(
+            effective_quote_reserves(RAW_QUOTE, Some(30_000_000_000)),
+            115_000_000_000
+        );
+        assert_eq!(
+            effective_quote_reserves(RAW_QUOTE, Some(-5_000_000_000)),
+            80_000_000_000
+        );
+    }
+
+    /// A negative adjustment larger than the vault balance would make the quote
+    /// side non-positive; clamp rather than wrap through the u64 cast.
+    #[test]
+    fn effective_quote_reserves_clamps_and_saturates() {
+        assert_eq!(effective_quote_reserves(RAW_QUOTE, Some(i128::MIN)), 0);
+        assert_eq!(
+            effective_quote_reserves(RAW_QUOTE, Some(-(RAW_QUOTE as i128) - 1)),
+            0
+        );
+        assert_eq!(
+            effective_quote_reserves(u64::MAX, Some(i128::MAX)),
+            u64::MAX
+        );
+    }
+
+    // === boost_buy_and_burn ===
+
+    /// BoostBuyAndBurnEvent shipped with the same upgrade and carries
+    /// `virtual_quote_reserves` (i128) *mid-struct* at 168, ahead of
+    /// `real_quote_reserves_after` — so it is decoded by fixed offset, unlike
+    /// the appended buy/sell field. Reported quote must already be effective.
+    #[test]
+    fn boost_buy_event_reports_effective_quote_reserves() {
+        let build = |virtual_quote: i128| {
+            let mut b = vec![0u8; 200];
+            b[152..160].copy_from_slice(&7_000_000u64.to_le_bytes()); // quote_used
+            b[160..168].copy_from_slice(&3_000_000u64.to_le_bytes()); // base_burned
+            b[168..184].copy_from_slice(&virtual_quote.to_le_bytes()); // i128
+            b[184..192].copy_from_slice(&85_000_000_000u64.to_le_bytes()); // real quote
+            b[192..200].copy_from_slice(&206_900_000_000_000u64.to_le_bytes()); // base after
+            b
+        };
+
+        assert_eq!(
+            extract_boost_buy_event(&build(0)),
+            Some((3_000_000, 7_000_000, 206_900_000_000_000, 85_000_000_000))
+        );
+        assert_eq!(
+            extract_boost_buy_event(&build(30_000_000_000)),
+            Some((3_000_000, 7_000_000, 206_900_000_000_000, 115_000_000_000))
+        );
+        // Negative adjustment applies, and over-subtraction clamps to zero.
+        assert_eq!(
+            extract_boost_buy_event(&build(-5_000_000_000)).map(|t| t.3),
+            Some(80_000_000_000)
+        );
+        assert_eq!(
+            extract_boost_buy_event(&build(i128::MIN)).map(|t| t.3),
+            Some(0)
+        );
+        // Truncated payload must not panic.
+        assert_eq!(extract_boost_buy_event(&build(0)[..199]), None);
     }
 }

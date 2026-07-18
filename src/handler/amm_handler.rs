@@ -16,7 +16,8 @@ use crate::utils::{
     AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BOOST_BUY_AND_BURN_DISCRIMINATOR,
     BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_SWAP_BOOST_BUY_EVENT_DISC,
     PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC, WSOL_MINT,
-    extract_boost_buy_event, extract_pool_reserves_from_data, extract_pump_swap_requested_amounts,
+    effective_quote_reserves, extract_boost_buy_event, extract_pool_reserves_from_data,
+    extract_pump_swap_requested_amounts, extract_pump_swap_virtual_quote_reserves,
     extract_quote_volume, extract_transaction_amounts, extract_transaction_fees, find_event_data,
     get_market_cap_from_reserves, get_program_instructions, is_canonical_pump_swap_pool,
     quote_currency_of, resolve_instruction_account, resolve_pump_swap_memecoin,
@@ -223,7 +224,7 @@ async fn process_pump_swap_tx(
                         let quote_volume = if is_buy { buy_vol } else { sell_vol };
                         if let (
                             Some(base_reserves),
-                            Some(quote_reserves),
+                            Some(raw_quote_reserves),
                             Some(quote_volume),
                             Some(token_amount),
                         ) = (
@@ -232,6 +233,14 @@ async fn process_pump_swap_tx(
                             quote_volume,
                             extract_transaction_amounts(event_data),
                         ) {
+                            // Price against effective quote reserves, not the
+                            // raw vault balance — matches what the boost path
+                            // above already reports. Absent on pre-2026-07-15
+                            // payloads, where effective == raw.
+                            let quote_reserves = effective_quote_reserves(
+                                raw_quote_reserves,
+                                extract_pump_swap_virtual_quote_reserves(event_data, is_buy),
+                            );
                             let market_cap = if canonical && mint != WSOL_MINT {
                                 // BuyEvent/SellEvent pool reserves are the
                                 // post-trade values. Applying the trade delta
@@ -345,7 +354,7 @@ mod tests {
     use crate::utils::{
         AMM_BUY_DISCRIMINATOR, AMM_SELL_DISCRIMINATOR, BOOST_BUY_AND_BURN_DISCRIMINATOR,
         BUY_EXACT_IN_DISCRIMINATOR, PUMP_SWAP_BOOST_BUY_EVENT_DISC, PUMP_SWAP_BUY_EVENT_DISC,
-        PUMP_SWAP_SELL_EVENT_DISC,
+        PUMP_SWAP_BUY_IX_NAME_OFFSET, PUMP_SWAP_SELL_EVENT_DISC, PUMP_SWAP_SELL_VQR_OFFSET,
     };
     use yellowstone_grpc_proto::prelude::{
         CompiledInstruction, InnerInstruction, InnerInstructions, Message, Transaction,
@@ -366,7 +375,21 @@ mod tests {
         }
     }
 
-    fn emitted_event(kind: &str, token: u64, quote: u64, stack_height: u32) -> InnerInstruction {
+    /// Reserves every synthetic buy/sell event reports, so market-cap
+    /// assertions can be written against known numbers.
+    const EVENT_BASE_RESERVES: u64 = 800;
+    const EVENT_RAW_QUOTE_RESERVES: u64 = 900;
+
+    /// `virtual_quote` = `Some(v)` builds a post-2026-07-15 payload carrying
+    /// `virtual_quote_reserves = v`; `None` builds the pre-upgrade layout,
+    /// which is what the pre-existing fixtures exercise.
+    fn emitted_event_with_virtual(
+        kind: &str,
+        token: u64,
+        quote: u64,
+        stack_height: u32,
+        virtual_quote: Option<i128>,
+    ) -> InnerInstruction {
         let (disc, len) = match kind {
             "sell" => (PUMP_SWAP_SELL_EVENT_DISC, 120),
             "boost_buy_and_burn" => (PUMP_SWAP_BOOST_BUY_EVENT_DISC, 200),
@@ -377,14 +400,36 @@ mod tests {
         if kind == "boost_buy_and_burn" {
             event[152..160].copy_from_slice(&quote.to_le_bytes());
             event[160..168].copy_from_slice(&token.to_le_bytes());
-            event[184..192].copy_from_slice(&900u64.to_le_bytes());
-            event[192..200].copy_from_slice(&800u64.to_le_bytes());
+            // virtual_quote_reserves (i128) sits mid-struct here, at 168..184.
+            event[168..184].copy_from_slice(&virtual_quote.unwrap_or(0).to_le_bytes());
+            event[184..192].copy_from_slice(&EVENT_RAW_QUOTE_RESERVES.to_le_bytes());
+            event[192..200].copy_from_slice(&EVENT_BASE_RESERVES.to_le_bytes());
         } else {
             event[16..24].copy_from_slice(&token.to_le_bytes());
-            event[48..56].copy_from_slice(&800u64.to_le_bytes());
-            event[56..64].copy_from_slice(&900u64.to_le_bytes());
+            event[48..56].copy_from_slice(&EVENT_BASE_RESERVES.to_le_bytes());
+            event[56..64].copy_from_slice(&EVENT_RAW_QUOTE_RESERVES.to_le_bytes());
             let quote_offset = if kind == "sell" { 64 } else { 112 };
             event[quote_offset..quote_offset + 8].copy_from_slice(&quote.to_le_bytes());
+
+            if let Some(virtual_quote) = virtual_quote {
+                // Grow the 120-byte stub out to the full post-upgrade layout.
+                // Buy and sell diverge after coin_creator_fee @352 — see
+                // `extract_pump_swap_virtual_quote_reserves`.
+                if kind == "sell" {
+                    event.resize(PUMP_SWAP_SELL_VQR_OFFSET, 0);
+                } else {
+                    event.resize(PUMP_SWAP_BUY_IX_NAME_OFFSET, 0);
+                    let ix_name = b"buy";
+                    event.extend_from_slice(&(ix_name.len() as u32).to_le_bytes());
+                    event.extend_from_slice(ix_name);
+                    // cashback_fee_basis_points, cashback,
+                    // buyback_fee_basis_points, buyback_fee
+                    event.extend(std::iter::repeat_n(0u8, 8 * 4));
+                }
+                event.extend_from_slice(&virtual_quote.to_le_bytes());
+                event.push(0); // can_boost
+                event.extend_from_slice(&0u64.to_le_bytes()); // base_supply
+            }
         }
 
         // Anchor emit_cpi! prefix followed by the event discriminator/payload.
@@ -399,6 +444,14 @@ mod tests {
     }
 
     fn fixture(with_events: bool, failed: bool) -> SubscribeUpdateTransactionInfo {
+        fixture_with_virtual(with_events, failed, None)
+    }
+
+    fn fixture_with_virtual(
+        with_events: bool,
+        failed: bool,
+        virtual_quote: Option<i128>,
+    ) -> SubscribeUpdateTransactionInfo {
         let user = Pubkey::new_unique();
         let global = Pubkey::new_unique();
         let base = Pubkey::new_unique();
@@ -453,7 +506,13 @@ mod tests {
             for (i, (kind, _)) in variants.iter().enumerate() {
                 inner_instructions.push(InnerInstructions {
                     index: i as u32,
-                    instructions: vec![emitted_event(kind, 100 + i as u64, 200 + i as u64, 2)],
+                    instructions: vec![emitted_event_with_virtual(
+                        kind,
+                        100 + i as u64,
+                        200 + i as u64,
+                        2,
+                        virtual_quote,
+                    )],
                 });
             }
 
@@ -466,7 +525,13 @@ mod tests {
                     data: trade.data,
                     stack_height: Some(2),
                 });
-                routed.push(emitted_event(kind, 100 + i as u64, 200 + i as u64, 3));
+                routed.push(emitted_event_with_virtual(
+                    kind,
+                    100 + i as u64,
+                    200 + i as u64,
+                    3,
+                    virtual_quote,
+                ));
             }
             inner_instructions.push(InnerInstructions {
                 index: 4,
@@ -491,6 +556,74 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// Drive the real handler and collect one market cap per trade variant.
+    async fn market_caps_for(virtual_quote: Option<i128>) -> Vec<Option<u64>> {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let tx = fixture_with_virtual(true, false, virtual_quote);
+        let whitelist = DashSet::new();
+        let mint = Pubkey::new_from_array(
+            tx.transaction
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .account_keys[3]
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        )
+        .to_string();
+        whitelist.insert(mint);
+        process_pump_swap_tx(tx, 42, &whitelist, &sender, false)
+            .await
+            .unwrap();
+        let mut caps = Vec::new();
+        for _ in 0..8 {
+            caps.push(receiver.recv().await.unwrap().market_cap);
+        }
+        caps
+    }
+
+    /// End-to-end wiring check: a non-zero `virtual_quote_reserves` must reach
+    /// the market cap through the real handler, for buy, buy_exact_quote_in and
+    /// sell alike — each of which decodes a different event layout.
+    ///
+    /// Doubling the quote side (raw 900 + virtual 900) doubles the price, and
+    /// hence the market cap, since the base side is untouched.
+    #[tokio::test]
+    async fn virtual_quote_reserves_reach_market_cap_for_every_variant() {
+        let baseline = market_caps_for(None).await;
+        let boosted = market_caps_for(Some(EVENT_RAW_QUOTE_RESERVES as i128)).await;
+
+        for (i, (base, boost)) in baseline.iter().zip(&boosted).enumerate() {
+            let base = base.expect("baseline market cap");
+            let boost = boost.expect("boosted market cap");
+            assert_eq!(
+                boost,
+                base * 2,
+                "variant {} (index {i}) did not price on effective reserves",
+                ["buy", "buy_exact_quote_in", "sell", "boost_buy_and_burn"][i % 4]
+            );
+        }
+    }
+
+    /// A negative adjustment that cancels the vault balance leaves no quote
+    /// side, so there is no meaningful price to report.
+    #[tokio::test]
+    async fn fully_offset_virtual_reserves_zero_the_market_cap() {
+        for cap in market_caps_for(Some(-(EVENT_RAW_QUOTE_RESERVES as i128))).await {
+            assert_eq!(cap, Some(0));
+        }
+    }
+
+    /// Phase 1 shipped the field as 0 on every pool; quotes must be unchanged
+    /// from the pre-upgrade payloads the other tests exercise.
+    #[tokio::test]
+    async fn phase_one_zero_virtual_reserves_change_nothing() {
+        assert_eq!(market_caps_for(Some(0)).await, market_caps_for(None).await);
     }
 
     #[tokio::test]
