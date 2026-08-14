@@ -67,7 +67,7 @@ where
 
 async fn manage_connection_with_retry<F, Fut>(
     endpoint: String,
-    request: SubscribeRequest,
+    mut request: SubscribeRequest,
     handler: F,
 ) where
     F: Fn(SubscribeUpdateTransactionInfo, u64) -> Fut + Clone + Send + Sync + 'static,
@@ -83,7 +83,14 @@ async fn manage_connection_with_retry<F, Fut>(
         );
 
         match setup_and_process_stream(&endpoint, request.clone(), handler.clone()).await {
-            Ok(_) => {
+            Ok(last_processed_slot) => {
+                if let Some(slot) = last_processed_slot {
+                    // `from_slot` is inclusive. Replaying the most recent slot
+                    // protects transactions around the disconnect without
+                    // replaying everything since process startup.
+                    request.from_slot = Some(slot);
+                    info!("[GRPC] Next connection will resume from slot {}", slot);
+                }
                 attempt_count = 0;
                 backoff_secs = INITIAL_BACKOFF_SECS;
                 info!("[GRPC] gRPC stream disconnected, reconnecting...");
@@ -116,7 +123,7 @@ async fn setup_and_process_stream<F, Fut>(
     endpoint: &str,
     request: SubscribeRequest,
     handler: F,
-) -> Result<()>
+) -> Result<Option<u64>>
 where
     F: Fn(SubscribeUpdateTransactionInfo, u64) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send,
@@ -138,12 +145,10 @@ where
 
     let stream = client.subscribe_once(request).await?;
 
-    process_stream(stream, handler).await;
-
-    Ok(())
+    Ok(process_stream(stream, handler).await)
 }
 
-async fn process_stream<S, F, Fut>(mut stream: S, handler: F)
+async fn process_stream<S, F, Fut>(mut stream: S, handler: F) -> Option<u64>
 where
     S: futures::Stream<
             Item = Result<yellowstone_grpc_proto::geyser::SubscribeUpdate, tonic::Status>,
@@ -154,6 +159,7 @@ where
     info!("[GRPC] gRPC stream started");
 
     let handler = Arc::new(handler);
+    let mut last_processed_slot = None;
 
     while let Some(message) = stream.next().await {
         match message {
@@ -164,8 +170,14 @@ where
                 {
                     if let Some(transaction_info) = tx.transaction {
                         let slot = tx.slot;
-                        if let Err(err) = handler(transaction_info, slot).await {
-                            error!("Handler error: {:?}", err);
+                        match handler(transaction_info, slot).await {
+                            Ok(()) => {
+                                last_processed_slot = Some(
+                                    last_processed_slot
+                                        .map_or(slot, |previous: u64| previous.max(slot)),
+                                );
+                            }
+                            Err(err) => error!("Handler error: {:?}", err),
                         }
                     }
                 }
@@ -178,6 +190,7 @@ where
     }
 
     info!("[GRPC] gRPC stream closed");
+    last_processed_slot
 }
 
 #[derive(Clone)]

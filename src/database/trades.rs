@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use log::{info, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
@@ -177,6 +178,11 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
         return Ok(());
     }
 
+    // A reconnect can replay a transaction while its first delivery is still
+    // buffered. PostgreSQL upserts handle conflicts with existing rows, but a
+    // single INSERT cannot update the same key twice. Keep the latest delivery
+    // for each composite primary key before building the VALUES list.
+    let trades = coalesce_duplicate_trades(trades);
     let client = pool.get().await?;
 
     const COLS: usize = 22;
@@ -196,7 +202,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         Vec::with_capacity(trades.len() * COLS);
 
-    for (i, trade) in trades.iter().enumerate() {
+    for (i, &trade) in trades.iter().enumerate() {
         let base_idx = i * COLS;
         query_parts.push(format!(
             "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::text::numeric, ${}::text::numeric, ${}::text::numeric, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
@@ -267,6 +273,25 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     Ok(())
 }
 
+/// Keep one record per database primary key while preserving the order in
+/// which each key first appeared. A later replay replaces the earlier value.
+fn coalesce_duplicate_trades(trades: &[TradeRecord]) -> Vec<&TradeRecord> {
+    let mut positions = HashMap::with_capacity(trades.len());
+    let mut unique = Vec::with_capacity(trades.len());
+
+    for trade in trades {
+        let key = (trade.tx_signature.as_str(), trade.ix_index);
+        if let Some(&position) = positions.get(&key) {
+            unique[position] = trade;
+        } else {
+            positions.insert(key, unique.len());
+            unique.push(trade);
+        }
+    }
+
+    unique
+}
+
 /// Spawn a background task that receives TradeRecords from a channel and batch-inserts them.
 /// Flushes every 60 seconds or when the buffer reaches 500 trades.
 pub fn spawn_batch_inserter(
@@ -321,12 +346,12 @@ pub fn spawn_batch_inserter(
     })
 }
 
-/// Delete records outside the intentional rolling 14-day retention window.
+/// Delete records outside the intentional rolling two-month retention window.
 pub async fn prune_old_trades(pool: &Pool) -> Result<u64> {
     let client = pool.get().await?;
     let rows = client
         .execute(
-            "DELETE FROM amm_trades WHERE created_at < NOW() - INTERVAL '14 days'",
+            "DELETE FROM amm_trades WHERE created_at < NOW() - INTERVAL '2 months'",
             &[],
         )
         .await?;
@@ -373,4 +398,55 @@ async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
         );
     }
     buffer.extend(retry);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trade(tx_signature: &str, ix_index: i32, token_amount: u64) -> TradeRecord {
+        TradeRecord {
+            tx_signature: tx_signature.to_string(),
+            ix_index,
+            pool_address: "pool".to_string(),
+            mint_address: "mint".to_string(),
+            quote_mint_address: "quote".to_string(),
+            instruction_type: "buy".to_string(),
+            amount_source: "event".to_string(),
+            is_cpi: false,
+            user_pubkey: "user".to_string(),
+            is_buy: true,
+            token_amount,
+            sol_amount: 1,
+            market_cap: Some(1),
+            is_usdc: false,
+            success: true,
+            slot: 1,
+            created_at: Utc::now(),
+            priority_fee: None,
+            transfer_tip: None,
+            tip_provider: None,
+            compute_units_consumed: None,
+            lamports_per_compute_unit: None,
+        }
+    }
+
+    #[test]
+    fn coalesces_duplicate_upsert_keys_and_keeps_latest_delivery() {
+        let trades = vec![
+            trade("same", 0, 10),
+            trade("other", 0, 20),
+            trade("same", 0, 30),
+            trade("same", 1, 40),
+        ];
+
+        let unique = coalesce_duplicate_trades(&trades);
+
+        assert_eq!(unique.len(), 3);
+        assert_eq!(unique[0].tx_signature, "same");
+        assert_eq!(unique[0].ix_index, 0);
+        assert_eq!(unique[0].token_amount, 30);
+        assert_eq!(unique[1].tx_signature, "other");
+        assert_eq!(unique[2].ix_index, 1);
+    }
 }
