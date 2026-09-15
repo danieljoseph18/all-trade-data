@@ -186,3 +186,47 @@ pub const PUMP_SWAP_BUY_EVENT_DISC: [u8; 8] = [103, 244, 82, 31, 44, 245, 119, 1
 pub const PUMP_SWAP_SELL_EVENT_DISC: [u8; 8] = [62, 47, 55, 10, 165, 3, 220, 42];
 /// BoostBuyAndBurnEvent — protocol-funded buy that changes pool price/reserves.
 pub const PUMP_SWAP_BOOST_BUY_EVENT_DISC: [u8; 8] = [63, 69, 28, 22, 48, 92, 194, 185];
+
+// === Raydium CPMM (stonk.fun post-migration venue) ===
+//
+// stonk.fun launches on Raydium LaunchLab (bonding curve) and migrates into
+// Raydium CPMM. This collector records every post-migration CPMM swap on a
+// whitelisted stonk.fun mint into `alt_trades`. Addresses, discriminators and
+// account positions mirror strategy-data (`STONK_FUN_PLAN.md` §1.1 / §1.6)
+// and are verified against the fixture in `fixtures/stonk/`.
+
+/// Raydium CPMM (constant-product AMM) program.
+pub const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+/// CPMM `amm_config` (index 11) that every stonk.fun migration pool is created
+/// under (`PlatformConfig.cpswap_config`). Swaps under any other config are
+/// manually created pools for the same mint and are never the migration pool.
+pub const STONK_CPMM_AMM_CONFIG: &str = "CRRS5ieQmBrZjWhcj99JuGrT5tyuWDaGAXLXLFjbAtjQ";
+/// Platform tag written to `alt_trades.platform`.
+pub const STONK_PLATFORM_NAME: &str = "stonk_fun";
+/// Venue tag written to `alt_trades.venue`.
+pub const RAYDIUM_CPMM_VENUE_NAME: &str = "raydium_cpmm";
+
+// Raydium CPMM instruction discriminators (raydium_cp_swap IDL v0.2.0).
+/// `swap_base_input(amount_in, minimum_amount_out)`.
+pub const CPMM_SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
+/// `swap_base_output(max_amount_in, amount_out)`.
+pub const CPMM_SWAP_BASE_OUTPUT_DISCRIMINATOR: [u8; 8] = [55, 217, 98, 86, 163, 74, 180, 173];
+/// Anchor `SwapEvent` discriminator. Shared by every Anchor program with an
+/// event named `SwapEvent` (e.g. Raydium CLMM, 213-byte body); the parser
+/// guards on the exact 162-byte CPMM body length.
+pub const CPMM_SWAP_EVENT_DISC: [u8; 8] = [64, 198, 205, 232, 38, 8, 113, 226];
+
+// CPMM swap_base_input / swap_base_output account positions (13).
+pub const CPMM_SWAP_PAYER_IX_POS: usize = 0;
+pub const CPMM_SWAP_AMM_CONFIG_IX_POS: usize = 2;
+pub const CPMM_SWAP_POOL_STATE_IX_POS: usize = 3;
+pub const CPMM_SWAP_INPUT_VAULT_IX_POS: usize = 6;
+pub const CPMM_SWAP_OUTPUT_VAULT_IX_POS: usize = 7;
+pub const CPMM_SWAP_INPUT_MINT_IX_POS: usize = 10;
+pub const CPMM_SWAP_OUTPUT_MINT_IX_POS: usize = 11;
+pub const CPMM_SWAP_MIN_ACCOUNTS: usize = 13;
+
+/// Seed prefix of the CPMM `PoolState` PDA:
+/// `PDA("pool", amm_config, token_0_mint, token_1_mint)` with the two mints
+/// in ascending pubkey-byte order.
+pub const CPMM_POOL_SEED: &[u8] = b"pool";

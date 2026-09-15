@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
     // In readonly we skip table creation/migration and whitelist loading.
     if !readonly {
         database::ensure_table(&db_pool).await?;
+        database::ensure_alt_table(&db_pool).await?;
     }
 
     let whitelist = if readonly {
@@ -69,37 +70,79 @@ async fn main() -> Result<()> {
         database::load_whitelist(&db_pool).await?
     };
 
-    // Create the trade record channel
+    // stonk.fun post-migration (Raydium CPMM → alt_trades). The alt_mints
+    // view is needed even in READONLY: it identifies which leg of a swap is
+    // the launch and supplies the quote mint / supply the decode depends on.
+    // Write mode tracks whitelisted & not blacklisted rows; READONLY widens
+    // to every migrated launch so the whole Stonk flow can be validated.
+    let alt_scope = if readonly {
+        database::AltMintScope::Migrated
+    } else {
+        database::AltMintScope::Whitelisted
+    };
+    info!("Loading alt_mints ({:?})...", alt_scope);
+    let alt_mints = database::load_alt_mints(&db_pool, alt_scope).await?;
+
+    // Create the trade record channels
     let (sender, receiver) = tokio::sync::mpsc::channel(10_000);
+    let (alt_sender, alt_receiver) = tokio::sync::mpsc::channel(10_000);
 
     // Background DB tasks only spawn in write mode.
-    let (whitelist_handle, inserter_handle, pruner_handle) = if readonly {
-        (None, None, None)
-    } else {
-        (
-            Some(database::spawn_whitelist_refresh(
-                db_pool.clone(),
-                whitelist.clone(),
-                running.clone(),
-            )),
-            Some(database::spawn_batch_inserter(
-                db_pool.clone(),
-                receiver,
-                running.clone(),
-            )),
-            Some(database::spawn_trade_pruner(
-                db_pool.clone(),
-                running.clone(),
-            )),
-        )
-    };
+    let (whitelist_handle, alt_mints_handle, inserter_handle, alt_inserter_handle, pruner_handle) =
+        if readonly {
+            (None, None, None, None, None)
+        } else {
+            (
+                Some(database::spawn_whitelist_refresh(
+                    db_pool.clone(),
+                    whitelist.clone(),
+                    running.clone(),
+                )),
+                Some(database::spawn_alt_mints_refresh(
+                    db_pool.clone(),
+                    alt_mints.clone(),
+                    alt_scope,
+                    running.clone(),
+                )),
+                Some(database::spawn_batch_inserter(
+                    db_pool.clone(),
+                    receiver,
+                    running.clone(),
+                )),
+                Some(database::spawn_batch_inserter(
+                    db_pool.clone(),
+                    alt_receiver,
+                    running.clone(),
+                )),
+                Some(database::spawn_trade_pruner(
+                    db_pool.clone(),
+                    running.clone(),
+                )),
+            )
+        };
 
-    // Create the AMM handler
+    // One gRPC stream carries PumpSwap and Raydium CPMM txs; each handler
+    // self-filters by program id.
     let amm_handler = handler::create_amm_handler(whitelist.clone(), sender.clone(), readonly);
+    let cpmm_handler = handler::create_cpmm_handler(alt_mints.clone(), alt_sender.clone(), readonly);
+    let tx_handler = move |tx: yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo,
+                           slot: u64| {
+        let amm = amm_handler(tx.clone(), slot);
+        let cpmm = cpmm_handler(tx, slot);
+        Box::pin(async move {
+            let (a, c) = tokio::join!(amm, cpmm);
+            a.and(c)
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+    };
 
     // Replay inclusively from just before the highest durably committed slot.
     // The request is reused on every reconnect, so anything received but not
     // committed before a disconnect/crash is delivered again and safely upserted.
+    // amm_trades is the checkpoint for the shared stream: both inserters flush
+    // on the same cadence, and alt_trades (a handful of whitelisted stonk.fun
+    // mints) can be silent for long stretches, so its own max slot would
+    // force needlessly deep replays.
     // GRPC_FROM_SLOT is an explicit override for deeper historical backfills.
     let replay_from_slot = match std::env::var("GRPC_FROM_SLOT") {
         Ok(value) => Some(
@@ -116,7 +159,7 @@ async fn main() -> Result<()> {
         "Initializing gRPC connection from slot {:?}...",
         replay_from_slot
     );
-    let grpc_handle = grpc::init_grpc_connection(amm_handler, replay_from_slot).await?;
+    let grpc_handle = grpc::init_grpc_connection(tx_handler, replay_from_slot).await?;
 
     // Listen for shutdown signals
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
@@ -153,20 +196,32 @@ async fn main() -> Result<()> {
         error!("[SHUTDOWN] Aborting whitelist refresh...");
         h.abort();
     }
+    if let Some(h) = alt_mints_handle {
+        error!("[SHUTDOWN] Aborting alt_mints refresh...");
+        h.abort();
+    }
     if let Some(h) = pruner_handle {
         error!("[SHUTDOWN] Aborting trade pruner...");
         h.abort();
     }
 
-    // Step 4: Drop sender to signal batch inserter to drain and stop
-    error!("[SHUTDOWN] Dropping trade sender...");
+    // Step 4: Drop senders to signal the batch inserters to drain and stop
+    error!("[SHUTDOWN] Dropping trade senders...");
     drop(sender);
+    drop(alt_sender);
 
-    // Step 5: Wait for batch inserter to finish draining
-    if let Some(h) = inserter_handle {
-        error!("[SHUTDOWN] Waiting for batch inserter to finish...");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), h).await;
-    }
+    // Step 5: Wait for the batch inserters to finish draining
+    let drain = async {
+        if let Some(h) = inserter_handle {
+            error!("[SHUTDOWN] Waiting for amm_trades batch inserter to finish...");
+            let _ = h.await;
+        }
+        if let Some(h) = alt_inserter_handle {
+            error!("[SHUTDOWN] Waiting for alt_trades batch inserter to finish...");
+            let _ = h.await;
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), drain).await;
 
     // Step 6: Close DB pool
     error!("[SHUTDOWN] Closing DB pool...");

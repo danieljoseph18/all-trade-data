@@ -18,7 +18,7 @@ use yellowstone_grpc_proto::prelude::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions,
 };
 
-use crate::utils::PUMP_SWAP_PROGRAM_ID;
+use crate::utils::{PUMP_SWAP_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 const INITIAL_BACKOFF_SECS: u64 = 1;
@@ -35,9 +35,13 @@ where
 {
     let endpoint = env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT must be set");
 
+    // One filter, `account_include` = any of the AMM programs we record:
+    // PumpSwap (→ amm_trades) and Raydium CPMM (→ alt_trades, stonk.fun
+    // post-migration). Each handler self-filters by program id, so a tx that
+    // touches both (aggregator routes) is parsed by both.
     let mut filters = HashMap::new();
     filters.insert(
-        "pump_swap_filter".to_string(),
+        "amm_filter".to_string(),
         SubscribeRequestFilterTransactions {
             vote: Some(false),
             // `None` = include both successful and failed txs. `Some(false)` would
@@ -45,7 +49,10 @@ where
             // `success = false` path would never receive them.
             failed: None,
             signature: None,
-            account_include: vec![PUMP_SWAP_PROGRAM_ID.to_string()],
+            account_include: vec![
+                PUMP_SWAP_PROGRAM_ID.to_string(),
+                RAYDIUM_CPMM_PROGRAM_ID.to_string(),
+            ],
             account_exclude: vec![],
             account_required: vec![],
         },

@@ -102,6 +102,7 @@ dependencies = [
  "futures",
  "log",
  "mimalloc",
+ "serde_json",
  "solana-program",
  "solana-sdk",
  "tokio",

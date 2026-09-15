@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use log::{info, warn};
 use std::collections::HashMap;
+use std::future::Future;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
@@ -182,7 +184,7 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     // buffered. PostgreSQL upserts handle conflicts with existing rows, but a
     // single INSERT cannot update the same key twice. Keep the latest delivery
     // for each composite primary key before building the VALUES list.
-    let trades = coalesce_duplicate_trades(trades);
+    let trades = coalesce_duplicate_rows(trades, |t| (t.tx_signature.as_str(), t.ix_index));
     let client = pool.get().await?;
 
     const COLS: usize = 22;
@@ -273,34 +275,61 @@ pub async fn batch_insert_trades(pool: &Pool, trades: &[TradeRecord]) -> Result<
     Ok(())
 }
 
-/// Keep one record per database primary key while preserving the order in
+/// Keep one row per database primary key while preserving the order in
 /// which each key first appeared. A later replay replaces the earlier value.
-fn coalesce_duplicate_trades(trades: &[TradeRecord]) -> Vec<&TradeRecord> {
-    let mut positions = HashMap::with_capacity(trades.len());
-    let mut unique = Vec::with_capacity(trades.len());
+pub fn coalesce_duplicate_rows<'a, T, K, F>(rows: &'a [T], key: F) -> Vec<&'a T>
+where
+    K: Eq + Hash,
+    F: Fn(&'a T) -> K,
+{
+    let mut positions = HashMap::with_capacity(rows.len());
+    let mut unique = Vec::with_capacity(rows.len());
 
-    for trade in trades {
-        let key = (trade.tx_signature.as_str(), trade.ix_index);
-        if let Some(&position) = positions.get(&key) {
-            unique[position] = trade;
+    for row in rows {
+        let k = key(row);
+        if let Some(&position) = positions.get(&k) {
+            unique[position] = row;
         } else {
-            positions.insert(key, unique.len());
-            unique.push(trade);
+            positions.insert(k, unique.len());
+            unique.push(row);
         }
     }
 
     unique
 }
 
-/// Spawn a background task that receives TradeRecords from a channel and batch-inserts them.
-/// Flushes every 60 seconds or when the buffer reaches 500 trades.
-pub fn spawn_batch_inserter(
+/// A row type with its own batched, idempotent upsert. Implemented by
+/// `TradeRecord` (`amm_trades`) and `AltTradeRecord` (`alt_trades`) so both
+/// tables share one inserter task and one retry/flush policy.
+pub trait BatchInsert: Sized + Clone + Send + Sync + 'static {
+    /// Table name, for logs.
+    const LABEL: &'static str;
+    /// Rows per INSERT statement. Must keep `rows * columns` under the
+    /// 65,535 bind-parameter limit.
+    const CHUNK: usize;
+
+    fn insert_batch(pool: &Pool, rows: &[Self]) -> impl Future<Output = Result<()>> + Send;
+}
+
+impl BatchInsert for TradeRecord {
+    const LABEL: &'static str = "amm_trades";
+    // 500 * 22 = 11,000 bind parameters per statement.
+    const CHUNK: usize = 500;
+
+    async fn insert_batch(pool: &Pool, rows: &[Self]) -> Result<()> {
+        batch_insert_trades(pool, rows).await
+    }
+}
+
+/// Spawn a background task that receives rows from a channel and batch-inserts them.
+/// Flushes every 60 seconds or when the buffer reaches 500 rows.
+pub fn spawn_batch_inserter<T: BatchInsert>(
     pool: Arc<Pool>,
-    mut receiver: mpsc::Receiver<TradeRecord>,
+    mut receiver: mpsc::Receiver<T>,
     running: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buffer: Vec<TradeRecord> = Vec::with_capacity(500);
+        let mut buffer: Vec<T> = Vec::with_capacity(500);
         let mut flush_ticker = interval(Duration::from_secs(60));
         flush_ticker.tick().await; // skip first immediate tick
 
@@ -342,16 +371,19 @@ pub fn spawn_batch_inserter(
             flush_buffer(&pool, &mut buffer).await;
         }
 
-        info!("Batch inserter shut down");
+        info!("Batch inserter [{}] shut down", T::LABEL);
     })
 }
 
-/// Delete records outside the intentional rolling two-month retention window.
-pub async fn prune_old_trades(pool: &Pool) -> Result<u64> {
+/// Tables subject to the rolling 14-day retention window.
+const PRUNED_TABLES: [&str; 2] = ["amm_trades", "alt_trades"];
+
+/// Delete records outside the intentional rolling 14-day retention window.
+pub async fn prune_old_trades(pool: &Pool, table: &str) -> Result<u64> {
     let client = pool.get().await?;
     let rows = client
         .execute(
-            "DELETE FROM amm_trades WHERE created_at < NOW() - INTERVAL '2 months'",
+            &format!("DELETE FROM {table} WHERE created_at < NOW() - INTERVAL '14 days'"),
             &[],
         )
         .await?;
@@ -367,33 +399,39 @@ pub fn spawn_trade_pruner(
         ticker.tick().await;
         while running.load(Ordering::Relaxed) {
             ticker.tick().await;
-            match prune_old_trades(&pool).await {
-                Ok(count) if count > 0 => info!("Pruned {} old trades", count),
-                Err(e) => warn!("Failed to prune old trades: {:?}", e),
-                _ => {}
+            for table in PRUNED_TABLES {
+                match prune_old_trades(&pool, table).await {
+                    Ok(count) if count > 0 => info!("Pruned {} old rows from {}", count, table),
+                    Err(e) => warn!("Failed to prune old rows from {}: {:?}", table, e),
+                    _ => {}
+                }
             }
         }
     })
 }
 
-async fn flush_buffer(pool: &Pool, buffer: &mut Vec<TradeRecord>) {
+async fn flush_buffer<T: BatchInsert>(pool: &Pool, buffer: &mut Vec<T>) {
     let pending = std::mem::take(buffer);
     let count = pending.len();
     let mut retry = Vec::new();
 
-    // Chunks of 500 keep us well under the 65,535 bound parameter limit
-    // (500 * 22 = 11,000).
-    for chunk in pending.chunks(500) {
-        if let Err(e) = batch_insert_trades(pool, chunk).await {
-            warn!("Failed to batch insert {} trades: {:?}", chunk.len(), e);
-            retry.extend_from_slice(chunk);
+    for chunk in pending.chunks(T::CHUNK) {
+        if let Err(e) = T::insert_batch(pool, chunk).await {
+            warn!(
+                "Failed to batch insert {} rows into {}: {:?}",
+                chunk.len(),
+                T::LABEL,
+                e
+            );
+            retry.extend(chunk.iter().cloned());
         }
     }
 
     if count > 0 {
         info!(
-            "Flushed {} trades to database; {} retained for retry",
+            "Flushed {} rows to {}; {} retained for retry",
             count - retry.len(),
+            T::LABEL,
             retry.len()
         );
     }
@@ -440,7 +478,7 @@ mod tests {
             trade("same", 1, 40),
         ];
 
-        let unique = coalesce_duplicate_trades(&trades);
+        let unique = coalesce_duplicate_rows(&trades, |t| (t.tx_signature.as_str(), t.ix_index));
 
         assert_eq!(unique.len(), 3);
         assert_eq!(unique[0].tx_signature, "same");
