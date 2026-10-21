@@ -1,6 +1,6 @@
 use anyhow::Result;
 use futures::StreamExt;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::env;
 use std::future::Future;
@@ -90,8 +90,19 @@ async fn manage_connection_with_retry<F, Fut>(
         );
 
         match setup_and_process_stream(&endpoint, request.clone(), handler.clone()).await {
-            Ok(last_processed_slot) => {
-                if let Some(slot) = last_processed_slot {
+            Ok(StreamEnd {
+                last_processed_slot,
+                replay_unavailable,
+            }) => {
+                if replay_unavailable {
+                    // The provider no longer holds from_slot; retrying it would
+                    // fail forever. Drop it and resume from the live tip.
+                    warn!(
+                        "[GRPC] Replay from slot {:?} is outside the provider's retention window; resuming live",
+                        request.from_slot
+                    );
+                    request.from_slot = None;
+                } else if let Some(slot) = last_processed_slot {
                     // `from_slot` is inclusive. Replaying the most recent slot
                     // protects transactions around the disconnect without
                     // replaying everything since process startup.
@@ -130,7 +141,7 @@ async fn setup_and_process_stream<F, Fut>(
     endpoint: &str,
     request: SubscribeRequest,
     handler: F,
-) -> Result<Option<u64>>
+) -> Result<StreamEnd>
 where
     F: Fn(SubscribeUpdateTransactionInfo, u64) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send,
@@ -155,7 +166,13 @@ where
     Ok(process_stream(stream, handler).await)
 }
 
-async fn process_stream<S, F, Fut>(mut stream: S, handler: F) -> Option<u64>
+struct StreamEnd {
+    last_processed_slot: Option<u64>,
+    /// The provider rejected `from_slot` as older than its replay window.
+    replay_unavailable: bool,
+}
+
+async fn process_stream<S, F, Fut>(mut stream: S, handler: F) -> StreamEnd
 where
     S: futures::Stream<
             Item = Result<yellowstone_grpc_proto::geyser::SubscribeUpdate, tonic::Status>,
@@ -167,6 +184,7 @@ where
 
     let handler = Arc::new(handler);
     let mut last_processed_slot = None;
+    let mut replay_unavailable = false;
 
     while let Some(message) = stream.next().await {
         match message {
@@ -191,13 +209,17 @@ where
             }
             Err(error) => {
                 error!("[GRPC] Stream error: {:?}", error);
+                replay_unavailable = error.code() == tonic::Code::OutOfRange;
                 break;
             }
         }
     }
 
     info!("[GRPC] gRPC stream closed");
-    last_processed_slot
+    StreamEnd {
+        last_processed_slot,
+        replay_unavailable,
+    }
 }
 
 #[derive(Clone)]
@@ -230,5 +252,21 @@ impl Interceptor for GrpcInterceptor {
             request.metadata_mut().insert("x-token", token.clone());
         }
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yellowstone_grpc_proto::geyser::SubscribeUpdate;
+
+    #[tokio::test]
+    async fn out_of_range_replay_is_reported() {
+        let stream = futures::stream::iter([Err::<SubscribeUpdate, _>(
+            tonic::Status::out_of_range("broadcast from 1 is not available, last available: 2"),
+        )]);
+        let end = process_stream(stream, |_tx, _slot| async { Ok(()) }).await;
+        assert!(end.replay_unavailable);
+        assert_eq!(end.last_processed_slot, None);
     }
 }
