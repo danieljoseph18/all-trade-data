@@ -21,20 +21,29 @@ from collections import Counter, defaultdict
 PUMP_AMM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 WSOL = "So11111111111111111111111111111111111111112"
-USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 DISCRIMINATORS = {
     bytes([102, 6, 61, 18, 1, 218, 235, 234]): ("buy", True),
     bytes([198, 46, 21, 82, 180, 217, 232, 112]): ("buy_exact_quote_in", True),
     bytes([51, 230, 133, 164, 1, 127, 131, 173]): ("sell", False),
     bytes([105, 68, 6, 175, 0, 7, 35, 162]): ("boost_buy_and_burn", True),
+    # v2 trades (pump-public-docs 8cda1fa): same accounts/args/events as v1.
+    bytes([184, 23, 238, 97, 103, 197, 211, 61]): ("buy_v2", True),
+    bytes([194, 171, 28, 70, 104, 77, 91, 47]): ("buy_exact_quote_in_v2", True),
+    bytes([93, 246, 130, 60, 231, 233, 64, 178]): ("sell_v2", False),
 }
+MULTI_HOP_SWAP = bytes([43, 100, 73, 19, 233, 246, 111, 148])
 EVENT_DISCRIMINATORS = {
     "buy": bytes([103, 244, 82, 31, 44, 245, 119, 119]),
     "buy_exact_quote_in": bytes([103, 244, 82, 31, 44, 245, 119, 119]),
     "sell": bytes([62, 47, 55, 10, 165, 3, 220, 42]),
     "boost_buy_and_burn": bytes([63, 69, 28, 22, 48, 92, 194, 185]),
+    "buy_v2": bytes([103, 244, 82, 31, 44, 245, 119, 119]),
+    "buy_exact_quote_in_v2": bytes([103, 244, 82, 31, 44, 245, 119, 119]),
+    "sell_v2": bytes([62, 47, 55, 10, 165, 3, 220, 42]),
 }
+BUY_EVENT = EVENT_DISCRIMINATORS["buy"]
+SELL_EVENT = EVENT_DISCRIMINATORS["sell"]
 
 
 def u64(raw: bytes, offset: int) -> int | None:
@@ -246,6 +255,12 @@ def transaction_trades(signature: str, transaction: dict) -> list[dict]:
         if instruction["programIdIndex"] != program_index:
             return
         decoded = b58decode(instruction["data"])
+        if decoded[:8] == MULTI_HOP_SWAP:
+            inspect_multi_hop(
+                instruction, decoded, path, depth, parent_outer_index,
+                start_inner_position, trade_stack,
+            )
+            return
         kind = DISCRIMINATORS.get(decoded[:8])
         if kind is None:
             return
@@ -260,7 +275,7 @@ def transaction_trades(signature: str, transaction: dict) -> list[dict]:
         # retain submitted bounds, explicitly labeled as non-executed amounts.
         arg0 = u64(decoded, 8) or 0
         arg1 = u64(decoded, 16) or 0
-        exact_in = name in {"buy_exact_quote_in", "boost_buy_and_burn"}
+        exact_in = name in {"buy_exact_quote_in", "buy_exact_quote_in_v2", "boost_buy_and_burn"}
         token_amount, quote_amount = (arg1, arg0) if exact_in else (arg0, arg1)
         amount_source = "instruction_request"
 
@@ -308,6 +323,113 @@ def transaction_trades(signature: str, transaction: dict) -> list[dict]:
                 "is_cpi": depth != "outer",
             }
         )
+
+    def payer_balance(rows_key: str, mint: str) -> int:
+        return sum(
+            int(row["uiTokenAmount"]["amount"])
+            for row in meta.get(rows_key) or []
+            if row.get("owner") == keys[0] and row["mint"] == mint
+        )
+
+    def inspect_multi_hop(
+        instruction, decoded, path, depth, parent_outer_index, start_inner_position, trade_stack
+    ) -> None:
+        # multi_hop_swap(amount_in, min_amount_out): 16 fixed accounts, then
+        # per hop [base_mint, quote_mint, pool | bonding_curve, base_vault,
+        # quote_vault]. Pool hops emit Buy/SellEvent as direct children;
+        # curve hops are pump TradeEvents and not PumpSwap pool trades.
+        accounts = instruction["accounts"]
+        hops = [
+            (keys[accounts[i]], keys[accounts[i + 1]], keys[accounts[i + 2]])
+            for i in range(16, len(accounts) - 4, 5)
+        ]
+        user = keys[accounts[0]]
+
+        def row(hop, is_buy, token_amount, quote_amount, amount_source):
+            # Independent routed test: the payer's balance of a middle coin
+            # does not move (it never reaches the wallet). Failed txs move
+            # nothing, so there use the route position instead.
+            if success:
+                routed = payer_balance("preTokenBalances", hop[0]) == payer_balance(
+                    "postTokenBalances", hop[0]
+                )
+            else:
+                user_hop = hops[-1] if is_buy else hops[0]
+                routed = user_hop[0] != hop[0]
+            trades.append(
+                {
+                    "signature": signature,
+                    "path": path,
+                    "depth": depth,
+                    "kind": "multi_hop_swap_routed" if routed else "multi_hop_swap",
+                    "is_buy": is_buy,
+                    "success": success,
+                    "mint": hop[0],
+                    "quote_mint": hop[1],
+                    "pool": hop[2],
+                    "user": user,
+                    "token_amount": token_amount,
+                    "quote_amount": quote_amount,
+                    "amount_source": amount_source,
+                    "is_cpi": depth != "outer",
+                }
+            )
+
+        if success:
+            next_hop = 0
+            for candidate in inner_blocks.get(parent_outer_index, [])[start_inner_position:]:
+                height = candidate.get("stackHeight")
+                if height is not None and height <= trade_stack:
+                    break
+                if height is not None and height != trade_stack + 1:
+                    continue
+                if candidate["programIdIndex"] != program_index:
+                    continue
+                event = b58decode(candidate["data"])[8:]
+                if event[:8] not in (BUY_EVENT, SELL_EVENT):
+                    continue
+                is_buy = event[:8] == BUY_EVENT
+                pool = b58encode(event[120:152])
+                match = next(
+                    (i for i in range(next_hop, len(hops)) if hops[i][2] == pool), None
+                )
+                if match is None:
+                    continue
+                next_hop = match + 1
+                row(hops[match], is_buy, u64(event, 16), u64(event, 112 if is_buy else 64), "event")
+            return
+
+        # Failed: the spent account's mint (pre-balance row) fixes each hop's side.
+        spent = next(
+            (
+                row_["mint"]
+                for row_ in meta.get("preTokenBalances") or []
+                if row_["accountIndex"] == accounts[1]
+            ),
+            None,
+        )
+        amount_in = u64(decoded, 8) or 0
+        min_out = u64(decoded, 16) or 0
+        current = spent
+        for i, hop in enumerate(hops):
+            if current == hop[1]:
+                is_buy, current = True, hop[0]
+            elif current == hop[0]:
+                is_buy, current = False, hop[1]
+            else:
+                return
+            token_amount = quote_amount = 0
+            if i == 0:
+                if is_buy:
+                    quote_amount = amount_in
+                else:
+                    token_amount = amount_in
+            if i == len(hops) - 1:
+                if is_buy:
+                    token_amount = min_out
+                else:
+                    quote_amount = min_out
+            row(hop, is_buy, token_amount, quote_amount, "instruction_request")
 
     for outer_index, instruction in enumerate(message["instructions"]):
         inspect(instruction, f"o:{outer_index}", "outer", outer_index, 0, 1)
@@ -363,7 +485,7 @@ def main() -> None:
                 signature,
                 {
                     "encoding": "json",
-                    "maxSupportedTransactionVersion": 0,
+                    "maxSupportedTransactionVersion": 1,
                     "commitment": "finalized",
                 },
             ],
@@ -375,7 +497,7 @@ def main() -> None:
                     trade
                     for trade in trades
                     if trade["mint"] != WSOL
-                    and trade["quote_mint"] in {WSOL, USDC}
+                    and trade["quote_mint"]
                     and trade["mint"] in whitelist
                     and trade["pool"]
                     == canonical_pool(trade["mint"], trade["quote_mint"])

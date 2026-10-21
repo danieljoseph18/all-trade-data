@@ -4,6 +4,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod database;
 mod grpc;
 mod handler;
+#[cfg(test)]
+mod test_support;
 mod utils;
 
 use anyhow::Result;

@@ -2,18 +2,26 @@ use solana_sdk::{compute_budget, pubkey::Pubkey};
 use yellowstone_grpc_proto::prelude::{CompiledInstruction, Message, TransactionStatusMeta};
 
 use super::{
-    ASTRALANE_TIP_ADDRESSES, BLOCKRAZOR_TIP_ADDRESSES, BLOCKROUTE_TIP_ADDRESSES,
-    FALCON_TIP_ADDRESSES, HELIUS_TIP_ADDRESSES, JITO_TIP_ADDRESSES, MOONLAND_TIP_ADDRESSES,
-    NEXTBLOCK_TIP_ADDRESSES, NODE_ONE_TIP_ADDRESSES, PUMP_SWAP_MINT_IX_POS, PUMP_SWAP_POOL_IX_POS,
-    PUMP_SWAP_QUOTE_MINT_IX_POS, SOYAS_TIP_ADDRESSES, STELLIUM_TIP_ADDRESSES,
-    TEMPORAL_TIP_ADDRESSES, USDC_BASE_UNIT, USDC_MINT, WSOL_MINT, ZEROSLOT_TIP_ADDRESSES,
+    AMM_BUY_DISCRIMINATOR, AMM_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR, AMM_BUY_V2_DISCRIMINATOR,
+    AMM_SELL_DISCRIMINATOR, AMM_SELL_V2_DISCRIMINATOR, ASTRALANE_TIP_ADDRESSES,
+    BLOCKRAZOR_TIP_ADDRESSES, BLOCKROUTE_TIP_ADDRESSES, BOOST_BUY_AND_BURN_DISCRIMINATOR,
+    BUY_EXACT_IN_DISCRIMINATOR, FALCON_TIP_ADDRESSES, HELIUS_TIP_ADDRESSES, JITO_TIP_ADDRESSES,
+    MOONLAND_TIP_ADDRESSES, NEXTBLOCK_TIP_ADDRESSES, NODE_ONE_TIP_ADDRESSES,
+    PUMP_SWAP_BOOST_BUY_EVENT_DISC, PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_MINT_IX_POS,
+    PUMP_SWAP_MULTI_HOP_ACCOUNTS_PER_HOP, PUMP_SWAP_MULTI_HOP_FIXED_ACCOUNTS,
+    PUMP_SWAP_MULTI_HOP_USER_IN_IX_POS, PUMP_SWAP_POOL_IX_POS, PUMP_SWAP_QUOTE_MINT_IX_POS,
+    PUMP_SWAP_SELL_EVENT_DISC, SOYAS_TIP_ADDRESSES, STELLIUM_TIP_ADDRESSES, TEMPORAL_TIP_ADDRESSES,
+    USDC_BASE_UNIT, USDC_MINT, WSOL_MINT, ZEROSLOT_TIP_ADDRESSES,
 };
 
-/// Supported quote currency for Pump AMM pools.
+/// Quote currency of a Pump AMM pool. SOL and USDC are named; every other
+/// quote (stock tokens, pump coins, ...) is `Other`, recorded in its own
+/// atomic units with `quote_mint_address` identifying the unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteCurrency {
     Sol,
     Usdc,
+    Other(Pubkey),
 }
 
 impl QuoteCurrency {
@@ -22,11 +30,16 @@ impl QuoteCurrency {
         matches!(self, QuoteCurrency::Usdc)
     }
 
+    /// Atomic units per whole quote token. `Other` quotes have no known
+    /// decimals here, so they stay in atomic units (1.0). Market cap in
+    /// native quote units does not depend on this: the unit cancels out of
+    /// `get_market_cap_in_quote`.
     #[inline]
     pub fn base_unit(self) -> f64 {
         match self {
             QuoteCurrency::Sol => super::SOL_BASE_UNIT,
             QuoteCurrency::Usdc => USDC_BASE_UNIT,
+            QuoteCurrency::Other(_) => 1.0,
         }
     }
 
@@ -35,18 +48,20 @@ impl QuoteCurrency {
         match self {
             QuoteCurrency::Sol => "SOL",
             QuoteCurrency::Usdc => "USDC",
+            QuoteCurrency::Other(_) => "OTHER",
         }
     }
 }
 
-/// Classify a quote mint into the supported Pump AMM set.
+/// Classify a quote mint. `None` means a malformed pubkey, not an
+/// unsupported currency: any valid mint other than WSOL/USDC is `Other`.
 pub fn quote_currency_of(quote_mint: &str) -> Option<QuoteCurrency> {
     if quote_mint == WSOL_MINT {
         Some(QuoteCurrency::Sol)
     } else if quote_mint == USDC_MINT {
         Some(QuoteCurrency::Usdc)
     } else {
-        None
+        quote_mint.parse::<Pubkey>().ok().map(QuoteCurrency::Other)
     }
 }
 
@@ -98,8 +113,8 @@ pub fn resolve_instruction_account(
     resolve_mint_from_instr(instr, full_accounts, position)
 }
 
-/// Verify that a PumpSwap trade targets the canonical index-0 pool created by
-/// the Pump migration program.
+/// The canonical index-0 PumpSwap pool of a pair — the pool the Pump
+/// migration program creates (`migrate` and `migrate_v2` alike).
 ///
 /// A zero creator-fee field in the trade event is not a safe canonical-pool
 /// signal: legitimate cashback and newer fee configurations can emit zero.
@@ -107,39 +122,16 @@ pub fn resolve_instruction_account(
 ///
 /// `pool = PDA("pool", 0u16, pool_authority, base_mint, quote_mint)`
 /// `pool_authority = PDA("pool-authority", base_mint)` (Pump program)
-pub fn is_canonical_pump_swap_pool(
-    instr: &CompiledInstruction,
-    full_accounts: &[Vec<u8>],
+pub fn canonical_pump_swap_pool(
+    base_mint: &Pubkey,
+    quote_mint: &Pubkey,
     pump_program_id: &Pubkey,
     pump_swap_program_id: &Pubkey,
-) -> bool {
-    fn account_pubkey(
-        instr: &CompiledInstruction,
-        full_accounts: &[Vec<u8>],
-        instruction_position: usize,
-    ) -> Option<Pubkey> {
-        let account_index = *instr.accounts.get(instruction_position)? as usize;
-        let bytes: [u8; 32] = full_accounts
-            .get(account_index)?
-            .as_slice()
-            .try_into()
-            .ok()?;
-        Some(Pubkey::new_from_array(bytes))
-    }
-
-    let Some(pool) = account_pubkey(instr, full_accounts, PUMP_SWAP_POOL_IX_POS) else {
-        return false;
-    };
-    let Some(base_mint) = account_pubkey(instr, full_accounts, PUMP_SWAP_MINT_IX_POS) else {
-        return false;
-    };
-    let Some(quote_mint) = account_pubkey(instr, full_accounts, PUMP_SWAP_QUOTE_MINT_IX_POS) else {
-        return false;
-    };
+) -> Pubkey {
     let (pool_authority, _) =
         Pubkey::find_program_address(&[b"pool-authority", base_mint.as_ref()], pump_program_id);
     let pool_index = 0u16.to_le_bytes();
-    let (expected_pool, _) = Pubkey::find_program_address(
+    Pubkey::find_program_address(
         &[
             b"pool",
             &pool_index,
@@ -148,9 +140,156 @@ pub fn is_canonical_pump_swap_pool(
             quote_mint.as_ref(),
         ],
         pump_swap_program_id,
-    );
+    )
+    .0
+}
 
-    pool == expected_pool
+/// A PumpSwap single-pool trade instruction, as classified by
+/// [`pump_swap_trade_ix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PumpSwapTradeIx {
+    /// Written to `amm_trades.instruction_type`.
+    pub name: &'static str,
+    pub is_buy: bool,
+    /// The two leading u64 args are (quote, base) instead of (base, quote).
+    pub is_exact_in: bool,
+    pub event_disc: &'static [u8; 8],
+}
+
+/// The one place every PumpSwap single-pool trade discriminator is listed.
+/// An unknown discriminator never errors — the trade just disappears — so a
+/// new instruction version must be added here (and to the IDL test).
+///
+/// `multi_hop_swap` is not a single-pool trade and is handled separately.
+pub fn pump_swap_trade_ix(disc: &[u8]) -> Option<PumpSwapTradeIx> {
+    let (name, is_buy, is_exact_in, event_disc) = match <[u8; 8]>::try_from(disc).ok()? {
+        AMM_BUY_DISCRIMINATOR => ("buy", true, false, &PUMP_SWAP_BUY_EVENT_DISC),
+        BUY_EXACT_IN_DISCRIMINATOR => ("buy_exact_quote_in", true, true, &PUMP_SWAP_BUY_EVENT_DISC),
+        AMM_SELL_DISCRIMINATOR => ("sell", false, false, &PUMP_SWAP_SELL_EVENT_DISC),
+        AMM_BUY_V2_DISCRIMINATOR => ("buy_v2", true, false, &PUMP_SWAP_BUY_EVENT_DISC),
+        AMM_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR => (
+            "buy_exact_quote_in_v2",
+            true,
+            true,
+            &PUMP_SWAP_BUY_EVENT_DISC,
+        ),
+        AMM_SELL_V2_DISCRIMINATOR => ("sell_v2", false, false, &PUMP_SWAP_SELL_EVENT_DISC),
+        BOOST_BUY_AND_BURN_DISCRIMINATOR => (
+            "boost_buy_and_burn",
+            true,
+            true,
+            &PUMP_SWAP_BOOST_BUY_EVENT_DISC,
+        ),
+        _ => return None,
+    };
+    Some(PumpSwapTradeIx {
+        name,
+        is_buy,
+        is_exact_in,
+        event_disc,
+    })
+}
+
+/// One hop of a PumpSwap `multi_hop_swap` route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PumpSwapHop {
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    /// The pool for a pool hop; the bonding curve for a curve hop.
+    pub pool: Pubkey,
+}
+
+/// The hops of a `multi_hop_swap`, in route order: groups of 5 accounts after
+/// the 16 fixed ones, `[base_mint, quote_mint, pool | bonding_curve,
+/// base_vault, quote_vault]`.
+pub fn multi_hop_swap_hops(
+    instr: &CompiledInstruction,
+    full_accounts: &[Vec<u8>],
+) -> Vec<PumpSwapHop> {
+    let key = |ix_pos: &u8| -> Option<Pubkey> {
+        let bytes: [u8; 32] = full_accounts
+            .get(*ix_pos as usize)?
+            .as_slice()
+            .try_into()
+            .ok()?;
+        Some(Pubkey::new_from_array(bytes))
+    };
+    instr
+        .accounts
+        .get(PUMP_SWAP_MULTI_HOP_FIXED_ACCOUNTS..)
+        .unwrap_or_default()
+        .chunks_exact(PUMP_SWAP_MULTI_HOP_ACCOUNTS_PER_HOP)
+        .filter_map(|hop| {
+            Some(PumpSwapHop {
+                base_mint: key(&hop[0])?,
+                quote_mint: key(&hop[1])?,
+                pool: key(&hop[2])?,
+            })
+        })
+        .collect()
+}
+
+/// Whether the hop trading `base_mint` is a *middle* hop of a route — a coin
+/// that never reaches the user's wallet (A in SOL → A → B, or in B → A → SOL).
+///
+/// Every hop of a route trades the same way. On a buy route the user ends up
+/// holding the last hop's base coin; on a sell route the user starts from the
+/// first hop's base coin. A one-hop route is never routed.
+pub fn multi_hop_is_routed(hops: &[PumpSwapHop], base_mint: &Pubkey, is_buy: bool) -> bool {
+    let user_hop = if is_buy { hops.last() } else { hops.first() };
+    user_hop.is_some_and(|h| h.base_mint != *base_mint)
+}
+
+/// The mint a `multi_hop_swap` route spends. Needed only for a failed route,
+/// which emits no events to read each hop's side from.
+///
+/// With 2+ hops it is the mint of hop 0 that hop 1 doesn't trade. A one-hop
+/// route (or an ambiguous pair) falls back to the token-balance row of
+/// `user_in_token_account`, which a failed tx still carries.
+pub fn multi_hop_input_mint(
+    instr: &CompiledInstruction,
+    meta: &TransactionStatusMeta,
+    hops: &[PumpSwapHop],
+) -> Option<Pubkey> {
+    if let [first, second, ..] = hops {
+        let shared = |m: &Pubkey| *m == second.base_mint || *m == second.quote_mint;
+        match (shared(&first.base_mint), shared(&first.quote_mint)) {
+            (true, false) => return Some(first.quote_mint),
+            (false, true) => return Some(first.base_mint),
+            _ => {}
+        }
+    }
+    let input_account = *instr.accounts.get(PUMP_SWAP_MULTI_HOP_USER_IN_IX_POS)? as u32;
+    meta.pre_token_balances
+        .iter()
+        .find(|b| b.account_index == input_account)
+        .and_then(|b| b.mint.parse().ok())
+}
+
+/// Each hop's side (`true` = buy) for a route that spends `input_mint`: a hop
+/// buys when it is fed its quote mint and sells when fed its base mint, and
+/// passes the other mint on. `None` if the route doesn't chain.
+pub fn multi_hop_sides(hops: &[PumpSwapHop], input_mint: &Pubkey) -> Option<Vec<bool>> {
+    let mut current = *input_mint;
+    hops.iter()
+        .map(|hop| {
+            if current == hop.quote_mint {
+                current = hop.base_mint;
+                Some(true)
+            } else if current == hop.base_mint {
+                current = hop.quote_mint;
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// PumpSwap BuyEvent / SellEvent `pool` at offset 120 (shared prefix).
+pub fn extract_pump_swap_event_pool(bytes: &[u8]) -> Option<Pubkey> {
+    let arr: [u8; 32] = bytes.get(120..152)?.try_into().ok()?;
+    Some(Pubkey::new_from_array(arr))
 }
 
 /// Locate an Anchor event payload within the inner instructions of a transaction.
@@ -177,47 +316,61 @@ pub fn find_event_data<'a>(
     pump_swap_program_index: u32,
     event_disc: &[u8; 8],
 ) -> Option<&'a [u8]> {
+    direct_child_events(
+        meta,
+        parent_outer_idx,
+        start_inner_pos,
+        pump_swap_program_index,
+    )
+    .find(|data| &data[..8] == event_disc)
+}
+
+/// Every event payload a PumpSwap instruction emits itself, in execution
+/// order — the direct-child self-CPIs of its subtree, with the bounds
+/// described on [`find_event_data`]. Each slice starts at the event disc.
+///
+/// `multi_hop_swap` needs all of them: it emits one BuyEvent / SellEvent per
+/// pool hop. Curve hops' `TradeEvent`s are emitted by pump one level deeper,
+/// and a nested PumpSwap trade's event sits under that trade, so neither is
+/// returned.
+pub fn direct_child_events<'a>(
+    meta: &'a TransactionStatusMeta,
+    parent_outer_idx: usize,
+    start_inner_pos: usize,
+    pump_swap_program_index: u32,
+) -> impl Iterator<Item = &'a [u8]> + 'a {
     let block = meta
         .inner_instructions
         .iter()
-        .find(|ii| ii.index as usize == parent_outer_idx)?;
+        .find(|ii| ii.index as usize == parent_outer_idx);
 
     // Top-level trades run at stack 1; a CPI trade's stack is read from its own
     // ix (which sits at `start_inner_pos - 1`, since callers pass `inner_pos + 1`).
-    let trade_stack: u32 = if start_inner_pos == 0 {
-        1
-    } else {
-        block
+    let trade_stack: u32 = match (block, start_inner_pos) {
+        (_, 0) | (None, _) => 1,
+        (Some(b), _) => b
             .instructions
             .get(start_inner_pos - 1)
             .and_then(|ix| ix.stack_height)
-            .unwrap_or(1)
+            .unwrap_or(1),
     };
 
-    for ix in block.instructions.iter().skip(start_inner_pos) {
+    block
+        .into_iter()
+        .flat_map(|b| b.instructions.iter())
+        .skip(start_inner_pos)
         // Leaving the trade's subtree — next ix belongs to a sibling, stop.
-        if let Some(h) = ix.stack_height {
-            if h <= trade_stack {
-                break;
-            }
-            // Anchor's emit_cpi! is a direct child of the trade invocation.
-            // Ignoring depth can attribute a nested trade's event to its
-            // ancestor when a custom program recursively invokes PumpSwap.
-            if h != trade_stack + 1 {
-                continue;
-            }
-        }
+        .take_while(move |ix| ix.stack_height.is_none_or(|h| h > trade_stack))
+        // Anchor's emit_cpi! is a direct child of the trade invocation.
+        // Ignoring depth can attribute a nested trade's event to its
+        // ancestor when a custom program recursively invokes PumpSwap.
+        .filter(move |ix| ix.stack_height.is_none_or(|h| h == trade_stack + 1))
         // The event must be PumpSwap's self-CPI, not arbitrary instruction
         // data crafted by another program with the same 8-byte discriminator.
-        if ix.program_id_index != pump_swap_program_index {
-            continue;
-        }
-        let data = ix.data.as_slice();
-        if data.len() >= 16 && &data[8..16] == event_disc {
-            return Some(&data[8..]);
-        }
-    }
-    None
+        .filter(move |ix| ix.program_id_index == pump_swap_program_index)
+        .map(|ix| ix.data.as_slice())
+        .filter(|data| data.len() >= 16)
+        .map(|data| &data[8..])
 }
 
 // All offsets below are relative to the event discriminator start (data[0..8]),
@@ -599,17 +752,36 @@ pub fn get_market_cap_in_quote(
 mod tests {
     use super::*;
     use crate::utils::{
-        AMM_SELL_DISCRIMINATOR, BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID,
-        PUMP_SWAP_BUY_EVENT_DISC, PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
+        BUY_EXACT_IN_DISCRIMINATOR, PUMP_PROGRAM_ID, PUMP_SWAP_BUY_EVENT_DISC,
+        PUMP_SWAP_PROGRAM_ID, PUMP_SWAP_SELL_EVENT_DISC,
     };
     use std::str::FromStr;
     use yellowstone_grpc_proto::prelude::{InnerInstruction, InnerInstructions};
 
     #[test]
-    fn quote_currency_supports_sol_and_usdc_only() {
+    fn quote_currency_classifies_every_valid_mint() {
         assert_eq!(quote_currency_of(WSOL_MINT), Some(QuoteCurrency::Sol));
         assert_eq!(quote_currency_of(USDC_MINT), Some(QuoteCurrency::Usdc));
-        assert_eq!(quote_currency_of("11111111111111111111111111111111"), None);
+        let other = Pubkey::new_unique();
+        assert_eq!(
+            quote_currency_of(&other.to_string()),
+            Some(QuoteCurrency::Other(other))
+        );
+        assert_eq!(quote_currency_of("not-a-pubkey"), None);
+    }
+
+    #[test]
+    fn market_cap_in_native_units_does_not_depend_on_quote_decimals() {
+        // 30 quote-atomic per 1e6 base-atomic: mc = quote * 1e15 / base.
+        let (base, quote) = (1_000_000_000_000u64, 30_000_000u64);
+        let expected = 30_000_000_000u64;
+        for ccy in [
+            QuoteCurrency::Sol,
+            QuoteCurrency::Usdc,
+            QuoteCurrency::Other(Pubkey::new_unique()),
+        ] {
+            assert_eq!(get_market_cap_from_reserves(base, quote, ccy), expected);
+        }
     }
 
     #[test]
@@ -646,44 +818,25 @@ mod tests {
             (
                 "Fr8astXNXz2dJDfvwCQnmqGprADkH89GSbHT5eRwfwMy",
                 "59dCaphi38eZHiuZjJ2n26BuEcktu9ohdH8eAQd8pump",
-                BUY_EXACT_IN_DISCRIMINATOR,
             ),
             (
                 "GQf9SMW9UVkJTiTibWjLSSQWFAhRvdHi58cyBw5y33NR",
                 "6PS6MdRgu3GdfL1ZW25v9xqVFhjBQYLf6yXEndpwY1ko",
-                AMM_SELL_DISCRIMINATOR,
             ),
         ];
 
-        for (pool, base, discriminator) in cases {
-            let full_accounts = vec![
-                Pubkey::from_str(pool).unwrap().to_bytes().to_vec(),
-                Pubkey::new_unique().to_bytes().to_vec(),
-                Pubkey::new_unique().to_bytes().to_vec(),
-                Pubkey::from_str(base).unwrap().to_bytes().to_vec(),
-                quote.to_bytes().to_vec(),
-            ];
-            let instr = CompiledInstruction {
-                program_id_index: 5,
-                accounts: vec![0, 1, 2, 3, 4],
-                data: discriminator.to_vec(),
-            };
-
-            assert!(is_canonical_pump_swap_pool(
-                &instr,
-                &full_accounts,
-                &pump_program,
-                &pump_swap_program,
-            ));
-
-            let mut spoofed_accounts = full_accounts;
-            spoofed_accounts[0] = Pubkey::new_unique().to_bytes().to_vec();
-            assert!(!is_canonical_pump_swap_pool(
-                &instr,
-                &spoofed_accounts,
-                &pump_program,
-                &pump_swap_program,
-            ));
+        for (pool, base) in cases {
+            let pool = Pubkey::from_str(pool).unwrap();
+            let base = Pubkey::from_str(base).unwrap();
+            assert_eq!(
+                canonical_pump_swap_pool(&base, &quote, &pump_program, &pump_swap_program),
+                pool
+            );
+            // Swapping the pair can't produce the same pool.
+            assert_ne!(
+                canonical_pump_swap_pool(&quote, &base, &pump_program, &pump_swap_program),
+                pool
+            );
         }
     }
 
@@ -723,6 +876,50 @@ mod tests {
         assert_eq!(
             find_event_data(&meta, 2, 1, 7, &event_disc).map(|data| &data[..8]),
             Some(event_disc.as_slice()),
+        );
+    }
+
+    /// `multi_hop_swap` reads every event it emits itself. A PumpSwap trade
+    /// nested under it (e.g. a route hop executed as its own `buy_v2` CPI)
+    /// has its own event one level deeper; that one belongs to the nested
+    /// trade, which records it — so the route must not, or the fill would be
+    /// counted twice.
+    #[test]
+    fn direct_child_events_skip_a_nested_trades_event() {
+        let event = |tag: u8, stack: u32| {
+            let mut data = vec![0u8; 16];
+            data[8..16].copy_from_slice(&PUMP_SWAP_BUY_EVENT_DISC);
+            data.push(tag);
+            InnerInstruction {
+                program_id_index: 7,
+                data,
+                stack_height: Some(stack),
+                ..Default::default()
+            }
+        };
+        let meta = TransactionStatusMeta {
+            inner_instructions: vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    event(1, 2),
+                    InnerInstruction {
+                        program_id_index: 7,
+                        data: crate::utils::AMM_BUY_V2_DISCRIMINATOR.to_vec(),
+                        stack_height: Some(2),
+                        ..Default::default()
+                    },
+                    event(2, 3),
+                    event(3, 2),
+                ],
+            }],
+            ..Default::default()
+        };
+        let tags: Vec<u8> = direct_child_events(&meta, 0, 0, 7).map(|d| d[8]).collect();
+        assert_eq!(tags, [1, 3]);
+        // The nested trade still finds its own event.
+        assert_eq!(
+            find_event_data(&meta, 0, 2, 7, &PUMP_SWAP_BUY_EVENT_DISC).map(|d| d[8]),
+            Some(2)
         );
     }
 

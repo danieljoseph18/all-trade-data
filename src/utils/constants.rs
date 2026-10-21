@@ -179,6 +179,30 @@ pub const AMM_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173
 pub const BUY_EXACT_IN_DISCRIMINATOR: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
 pub const BOOST_BUY_AND_BURN_DISCRIMINATOR: [u8; 8] = [105, 68, 6, 175, 0, 7, 35, 162];
 
+// v2 trades (pump-public-docs 8cda1fa, 2026-10-08; live on mainnet since the
+// 2026-10-02 deploy). Same account prefix as v1 (pool 0, user 1, base_mint 3,
+// quote_mint 4) and the same leading two u64 args; they emit the same
+// BuyEvent / SellEvent. The bytes equal pump's own `buy_v2` / `sell_v2` /
+// `buy_exact_quote_in_v2`, since an Anchor disc hashes only the ix name —
+// always match them together with the PumpSwap program id.
+pub const AMM_BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
+pub const AMM_SELL_V2_DISCRIMINATOR: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
+pub const AMM_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR: [u8; 8] = [194, 171, 28, 70, 104, 77, 91, 47];
+/// `multi_hop_swap(amount_in, min_amount_out)`: one ix trading a route of 1+
+/// PumpSwap pools and/or pump bonding curves. Pool hops emit their own
+/// BuyEvent / SellEvent as direct children; curve hops run through pump's
+/// `multi_hop_curve_swap` and are not recorded here.
+pub const AMM_MULTI_HOP_SWAP_DISCRIMINATOR: [u8; 8] = [43, 100, 73, 19, 233, 246, 111, 148];
+/// `multi_hop_swap` fixed accounts (user 0, user_in_token_account 1, ...);
+/// hop groups follow.
+pub const PUMP_SWAP_MULTI_HOP_FIXED_ACCOUNTS: usize = 16;
+/// Per hop: `[base_mint, quote_mint, pool | bonding_curve, base_vault, quote_vault]`.
+pub const PUMP_SWAP_MULTI_HOP_ACCOUNTS_PER_HOP: usize = 5;
+/// `multi_hop_swap` user (fee payer of the route).
+pub const PUMP_SWAP_MULTI_HOP_USER_IX_POS: usize = 0;
+/// `multi_hop_swap` user_in_token_account: the account the route spends from.
+pub const PUMP_SWAP_MULTI_HOP_USER_IN_IX_POS: usize = 1;
+
 // === PumpSwap Anchor self-CPI event discriminators ===
 /// BuyEvent — emitted for buy / buy_exact_quote_in
 pub const PUMP_SWAP_BUY_EVENT_DISC: [u8; 8] = [103, 244, 82, 31, 44, 245, 119, 119];
@@ -230,3 +254,148 @@ pub const CPMM_SWAP_MIN_ACCOUNTS: usize = 13;
 /// `PDA("pool", amm_config, token_0_mint, token_1_mint)` with the two mints
 /// in ascending pubkey-byte order.
 pub const CPMM_POOL_SEED: &[u8] = b"pool";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::pump_swap_trade_ix;
+    use serde_json::Value;
+
+    /// pump-fun/pump-public-docs `idl/pump_amm.json` @ 8cda1fa (2026-10-08).
+    const PUMP_AMM_IDL: &str = include_str!("../../fixtures/pump/pump_amm_idl.json");
+
+    fn idl_ix<'a>(idl: &'a Value, name: &str) -> &'a Value {
+        idl["instructions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ix| ix["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from the IDL"))
+    }
+
+    fn disc(v: &Value) -> [u8; 8] {
+        let bytes: Vec<u8> = v["discriminator"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b.as_u64().unwrap() as u8)
+            .collect();
+        bytes.try_into().unwrap()
+    }
+
+    fn account_pos(ix: &Value, name: &str) -> usize {
+        ix["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|a| a["name"] == name)
+            .unwrap_or_else(|| panic!("{} has no account {name}", ix["name"]))
+    }
+
+    /// Every discriminator and account position the handler relies on, read
+    /// from the vendored IDL — so a future IDL refresh fails `cargo test`
+    /// instead of silently dropping trades in production.
+    #[test]
+    fn pump_swap_discriminators_and_positions_match_idl() {
+        let idl: Value = serde_json::from_str(PUMP_AMM_IDL).unwrap();
+
+        let trade_ixs = [
+            ("buy", AMM_BUY_DISCRIMINATOR),
+            ("buy_exact_quote_in", BUY_EXACT_IN_DISCRIMINATOR),
+            ("sell", AMM_SELL_DISCRIMINATOR),
+            ("buy_v2", AMM_BUY_V2_DISCRIMINATOR),
+            (
+                "buy_exact_quote_in_v2",
+                AMM_BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR,
+            ),
+            ("sell_v2", AMM_SELL_V2_DISCRIMINATOR),
+            ("boost_buy_and_burn", BOOST_BUY_AND_BURN_DISCRIMINATOR),
+        ];
+        for (name, constant) in trade_ixs {
+            let ix = idl_ix(&idl, name);
+            assert_eq!(disc(ix), constant, "{name} discriminator");
+            let kind =
+                pump_swap_trade_ix(&constant).unwrap_or_else(|| panic!("{name} unclassified"));
+            assert_eq!(kind.name, name);
+            if name == "boost_buy_and_burn" {
+                continue;
+            }
+            assert_eq!(
+                account_pos(ix, "pool"),
+                PUMP_SWAP_POOL_IX_POS,
+                "{name} pool"
+            );
+            assert_eq!(account_pos(ix, "user"), 1, "{name} user");
+            assert_eq!(
+                account_pos(ix, "base_mint"),
+                PUMP_SWAP_MINT_IX_POS,
+                "{name} base_mint"
+            );
+            assert_eq!(
+                account_pos(ix, "quote_mint"),
+                PUMP_SWAP_QUOTE_MINT_IX_POS,
+                "{name} quote_mint"
+            );
+            // The two leading u64 args the failed-tx path reads, in order.
+            let args: Vec<(&str, &str)> = ix["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(2)
+                .map(|a| {
+                    (
+                        a["name"].as_str().unwrap(),
+                        a["type"].as_str().unwrap_or(""),
+                    )
+                })
+                .collect();
+            let quote_first = args[0].0.contains("quote");
+            assert_eq!(quote_first, kind.is_exact_in, "{name} arg order {args:?}");
+            assert!(
+                args.iter().all(|(_, t)| *t == "u64"),
+                "{name} args {args:?}"
+            );
+        }
+
+        // Every buy/sell-family instruction in the IDL must be classified (or
+        // be multi_hop_swap), so a new version can't slip in unnoticed.
+        for ix in idl["instructions"].as_array().unwrap() {
+            let name = ix["name"].as_str().unwrap();
+            if (name.starts_with("buy") || name.starts_with("sell")) && name != "buyback" {
+                assert!(
+                    pump_swap_trade_ix(&disc(ix)).is_some(),
+                    "PumpSwap trade instruction {name} is not handled"
+                );
+            }
+        }
+
+        let mh = idl_ix(&idl, "multi_hop_swap");
+        assert_eq!(disc(mh), AMM_MULTI_HOP_SWAP_DISCRIMINATOR);
+        assert_eq!(
+            mh["accounts"].as_array().unwrap().len(),
+            PUMP_SWAP_MULTI_HOP_FIXED_ACCOUNTS
+        );
+        assert_eq!(account_pos(mh, "user"), PUMP_SWAP_MULTI_HOP_USER_IX_POS);
+        assert_eq!(
+            account_pos(mh, "user_in_token_account"),
+            PUMP_SWAP_MULTI_HOP_USER_IN_IX_POS
+        );
+        let mh_args: Vec<&str> = mh["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(mh_args, ["amount_in", "min_amount_out"]);
+
+        let events = idl["events"].as_array().unwrap();
+        for (name, constant) in [
+            ("BuyEvent", PUMP_SWAP_BUY_EVENT_DISC),
+            ("SellEvent", PUMP_SWAP_SELL_EVENT_DISC),
+            ("BoostBuyAndBurnEvent", PUMP_SWAP_BOOST_BUY_EVENT_DISC),
+        ] {
+            let ev = events.iter().find(|e| e["name"] == name).unwrap();
+            assert_eq!(disc(ev), constant, "{name} discriminator");
+        }
+    }
+}
